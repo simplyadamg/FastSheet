@@ -60,6 +60,8 @@ final class Store {
     private var groupHotKeys: [UUID: EventHotKeyRef] = [:]
     private var hotkeyCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) }
     private var hotkeyModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))) }
+    private var closeAllCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "closeAllCode")) }
+    private var closeAllModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "closeAllModifiers"))) }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -67,7 +69,8 @@ final class Store {
         status.button?.title = "▰"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Show FinderStack", action: #selector(toggle), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Set Hotkey…", action: #selector(recordHotkey), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Popup Hotkey…", action: #selector(recordHotkey), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Close All Hotkey…", action: #selector(recordCloseAllHotkey), keyEquivalent: ""))
         let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -77,6 +80,7 @@ final class Store {
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.pollFinder() }
         localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if let self, self.matches(event) { self.toggle(); return nil }
+            if let self, self.matchesCloseAll(event) { self.closeAll(); return nil }
             if let self, self.openGroupForLocalHotkey(event) { return nil }
             return event
         }
@@ -195,16 +199,37 @@ final class Store {
         return event.keyCode == hotkeyCode && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == hotkeyModifiers.intersection(.deviceIndependentFlagsMask)
     }
 
+    private func matchesCloseAll(_ event: NSEvent) -> Bool {
+        guard panel?.isVisible == true, NSApp.isActive, NSApp.modalWindow == nil, UserDefaults.standard.object(forKey: "closeAllCode") != nil else { return false }
+        return event.keyCode == closeAllCode && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == closeAllModifiers.intersection(.deviceIndependentFlagsMask)
+    }
+
+    private func closeAll() {
+        dismissPanel()
+        NSAppleScript(source: "tell application \"Finder\" to close every Finder window")?.executeAndReturnError(nil)
+    }
+
     @objc private func recordHotkey() {
         let alert = NSAlert(); alert.messageText = "Set FinderStack Hotkey"; alert.informativeText = "Click the field, then press the key combination you want to use."; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
         let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = hotkeyCode == 0 ? "Press a shortcut…" : "Current shortcut: \(hotkeyLabel())"; alert.accessoryView = field
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }
-        UserDefaults.standard.set(Int(event.keyCode), forKey: "hotkeyCode"); UserDefaults.standard.set(Int(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue), forKey: "hotkeyModifiers")
+        UserDefaults.standard.set(Int(event.keyCode), forKey: "hotkeyCode"); UserDefaults.standard.set(Int(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue), forKey: "hotkeyModifiers"); UserDefaults.standard.set(HotkeyField.display(for: event), forKey: "hotkeyDisplay")
         installCarbonHotkey()
     }
 
-    private func hotkeyLabel() -> String { "Configured" }
+    @objc private func recordCloseAllHotkey() {
+        let alert = NSAlert(); alert.messageText = "Set Close All Hotkey"; alert.informativeText = "This shortcut works only while the FinderStack popup is focused."; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = UserDefaults.standard.object(forKey: "closeAllCode") == nil ? "Press a shortcut…" : "Current shortcut: \(hotkeyLabel(key: closeAllCode, modifiers: closeAllModifiers.rawValue, displayKey: "closeAllDisplay") )"; alert.accessoryView = field; alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+        let conflicts = (UserDefaults.standard.object(forKey: "hotkeyCode") != nil && hotkeyCode == event.keyCode && hotkeyModifiers.rawValue == modifiers) || Store().groups.contains { $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == modifiers }
+        guard !conflicts else { NSAlert(error: NSError(domain: "FinderStack", code: 2, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or a group."])).runModal(); return }
+        UserDefaults.standard.set(Int(event.keyCode), forKey: "closeAllCode"); UserDefaults.standard.set(Int(modifiers), forKey: "closeAllModifiers"); UserDefaults.standard.set(HotkeyField.display(for: event), forKey: "closeAllDisplay")
+    }
+
+    private func hotkeyLabel() -> String { hotkeyLabel(key: hotkeyCode, modifiers: hotkeyModifiers.rawValue, displayKey: "hotkeyDisplay") }
+    private func hotkeyLabel(key: UInt16, modifiers: UInt, displayKey: String) -> String { UserDefaults.standard.string(forKey: displayKey) ?? HotkeyField.label(keyCode: key, modifiers: modifiers) }
 
     @objc private func toggleLogin(_ item: NSMenuItem) {
         do { if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister(); item.state = .off } else { try SMAppService.mainApp.register(); item.state = .on } } catch { NSAlert(error: error).runModal() }
@@ -258,10 +283,22 @@ final class HotkeyField: NSTextField {
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool { isEditable = false; isSelectable = false; wantsLayer = true; layer?.borderWidth = 1; layer?.borderColor = NSColor.controlAccentColor.cgColor; return super.becomeFirstResponder() }
     override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
-    override func keyDown(with event: NSEvent) { self.event = event; stringValue = HotkeyField.modifierLabel(event.modifierFlags) + (event.charactersIgnoringModifiers ?? "").uppercased() }
+    override func keyDown(with event: NSEvent) { self.event = event; stringValue = HotkeyField.display(for: event) }
     static func display(for event: NSEvent) -> String { modifierLabel(event.modifierFlags) + keyLabel(event) }
+    static func label(keyCode: UInt16, modifiers: UInt) -> String { modifierLabel(NSEvent.ModifierFlags(rawValue: modifiers)) + keyLabel(keyCode: keyCode) }
     private static func modifierLabel(_ flags: NSEvent.ModifierFlags) -> String { var s = ""; if flags.contains(.command) { s += "⌘" }; if flags.contains(.option) { s += "⌥" }; if flags.contains(.control) { s += "⌃" }; if flags.contains(.shift) { s += "⇧" }; return s }
     private static func keyLabel(_ event: NSEvent) -> String { switch event.keyCode { case 36: return "↩"; case 48: return "⇥"; case 49: return "Space"; case 51: return "⌫"; case 53: return "⎋"; case 122: return "F1"; case 120: return "F2"; case 99: return "F3"; case 118: return "F4"; case 96: return "F5"; case 97: return "F6"; case 98: return "F7"; case 100: return "F8"; case 101: return "F9"; case 109: return "F10"; case 103: return "F11"; case 111: return "F12"; default: return (event.charactersIgnoringModifiers ?? "").uppercased() } }
+    private static func keyLabel(keyCode: UInt16) -> String {
+        switch keyCode {
+        case 0: return "A"; case 1: return "S"; case 2: return "D"; case 3: return "F"; case 4: return "H"; case 5: return "G"; case 6: return "Z"; case 7: return "X"; case 8: return "C"; case 9: return "V"; case 11: return "B"
+        case 12: return "Q"; case 13: return "W"; case 14: return "E"; case 15: return "R"; case 16: return "Y"; case 17: return "T"
+        case 18: return "1"; case 19: return "2"; case 20: return "3"; case 21: return "4"; case 22: return "6"; case 23: return "5"; case 24: return "="; case 25: return "9"; case 26: return "7"; case 27: return "-"; case 28: return "8"; case 29: return "0"
+        case 31: return "O"; case 32: return "U"; case 33: return "["; case 34: return "I"; case 35: return "P"; case 37: return "L"; case 38: return "J"; case 39: return "'"; case 40: return "K"; case 41: return ";"; case 42: return "\\"; case 43: return ","; case 44: return "/"; case 45: return "N"; case 46: return "M"; case 47: return "."; case 50: return "`"
+        case 36: return "↩"; case 48: return "⇥"; case 49: return "Space"; case 51: return "⌫"; case 53: return "⎋"; case 123: return "←"; case 124: return "→"; case 125: return "↓"; case 126: return "↑"
+        case 122: return "F1"; case 120: return "F2"; case 99: return "F3"; case 118: return "F4"; case 96: return "F5"; case 97: return "F6"; case 98: return "F7"; case 100: return "F8"; case 101: return "F9"; case 109: return "F10"; case 103: return "F11"; case 111: return "F12"
+        default: return "Key \(keyCode)"
+        }
+    }
 }
 
 final class PopupPanel: NSPanel {
