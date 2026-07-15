@@ -9,9 +9,22 @@ struct FolderEntry: Codable, Identifiable, Equatable {
     let path: String
 }
 
+struct FolderGroup: Codable, Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var folders: [FolderEntry]
+    var hotkeyCode: UInt16?
+    var hotkeyModifiers: UInt
+}
+
+private extension Array {
+    subscript(safe index: Index) -> Element? { indices.contains(index) ? self[index] : nil }
+}
+
 final class Store {
     private let key = "folderHistory"
     private let hotlistKey = "folderHotlist"
+    private let groupsKey = "folderGroups"
     var entries: [FolderEntry] {
         get { (UserDefaults.standard.data(forKey: key)).flatMap { try? JSONDecoder().decode([FolderEntry].self, from: $0) } ?? [] }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: key) }
@@ -19,6 +32,10 @@ final class Store {
     var hotlist: [FolderEntry] {
         get { (UserDefaults.standard.data(forKey: hotlistKey)).flatMap { try? JSONDecoder().decode([FolderEntry].self, from: $0) } ?? [] }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: hotlistKey) }
+    }
+    var groups: [FolderGroup] {
+        get { (UserDefaults.standard.data(forKey: groupsKey)).flatMap { try? JSONDecoder().decode([FolderGroup].self, from: $0) } ?? [] }
+        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: groupsKey) }
     }
     func record(_ url: URL) {
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
@@ -38,6 +55,7 @@ final class Store {
     private var localHotkeyMonitor: Any?
     private var carbonHotKey: EventHotKeyRef?
     private var carbonHandler: EventHandlerRef?
+    private var groupHotKeys: [UUID: EventHotKeyRef] = [:]
     private var hotkeyCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) }
     private var hotkeyModifiers: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))) }
 
@@ -78,7 +96,7 @@ final class Store {
     }
 
     private func showPanel() {
-        let controller = PopupController(entries: store.entries, hotlist: store.hotlist, onHotlistChanged: { [weak self] items in self?.store.hotlist = items }) { [weak self] paths, isMultiSelection in
+        let controller = PopupController(entries: store.entries, hotlist: store.hotlist, groups: store.groups, onHotlistChanged: { [weak self] items in self?.store.hotlist = items }, onGroupsChanged: { [weak self] items in self?.store.groups = items; self?.installCarbonHotkey() }) { [weak self] paths, isMultiSelection in
             guard let self else { return }
             self.panel?.orderOut(nil); self.panel?.close(); self.panel = nil
             DispatchQueue.main.async {
@@ -192,7 +210,9 @@ final class Store {
             let callback: EventHandlerUPP = { _, event, userData in
                 guard let event, let userData else { return noErr }
                 let owner = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                DispatchQueue.main.async { owner.toggle() }
+                var id = EventHotKeyID(); var size = MemoryLayout<EventHotKeyID>.size
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, size, &size, &id)
+                DispatchQueue.main.async { owner.handleHotkey(id.id) }
                 return noErr
             }
             InstallEventHandler(GetApplicationEventTarget(), callback, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &carbonHandler)
@@ -202,7 +222,11 @@ final class Store {
         var ref: EventHotKeyRef?
         RegisterEventHotKey(UInt32(hotkeyCode), carbonModifiers(), id, GetApplicationEventTarget(), 0, &ref)
         carbonHotKey = ref
+        for (_, ref) in groupHotKeys { UnregisterEventHotKey(ref) }; groupHotKeys.removeAll()
+        for (index, group) in Store().groups.enumerated() { guard let code = group.hotkeyCode else { continue }; var groupID = EventHotKeyID(signature: OSType(0x4653544B), id: UInt32(index + 100)); var groupRef: EventHotKeyRef?; RegisterEventHotKey(UInt32(code), UInt32(group.hotkeyModifiers), groupID, GetApplicationEventTarget(), 0, &groupRef); if let groupRef { groupHotKeys[group.id] = groupRef } }
     }
+
+    private func handleHotkey(_ id: UInt32) { if id == 1 { toggle(); return }; let savedGroups = Store().groups; let index = Int(id) - 100; guard savedGroups.indices.contains(index) else { return }; let paths = savedGroups[index].folders.map(\.path); if paths.count > 1 { openFolderLayout(paths) } else if let path = paths.first { openFolder(path) } }
 
     private func carbonModifiers() -> UInt32 {
         let flags = hotkeyModifiers; var result: UInt32 = 0
@@ -222,37 +246,43 @@ final class HotkeyField: NSTextField {
 
 final class PopupController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private let folderPasteboardType = NSPasteboard.PasteboardType("com.finderstack.folder-path")
-    private let entries: [FolderEntry]; private var hotlist: [FolderEntry]
-    private let onHotlistChanged: ([FolderEntry]) -> Void; private let onOpen: ([String], Bool) -> Void; private let onClose: () -> Void
-    private let search = NSSearchField(), recentTable = NSTableView(), hotlistTable = NSTableView()
-    private let recentScroll = NSScrollView(), hotlistScroll = NSScrollView()
-    private var filteredRecent: [FolderEntry] = [], filteredHotlist: [FolderEntry] = [], selected: [FolderEntry] = []; private var flagsMonitor: Any?
+    private let groupPasteboardType = NSPasteboard.PasteboardType("com.finderstack.group-id")
+    private let entries: [FolderEntry]; private var hotlist: [FolderEntry]; private var groups: [FolderGroup]
+    private let onHotlistChanged: ([FolderEntry]) -> Void; private let onGroupsChanged: ([FolderGroup]) -> Void; private let onOpen: ([String], Bool) -> Void; private let onClose: () -> Void
+    private let search = NSSearchField(), recentTable = NSTableView(), hotlistTable = NSTableView(), groupTable = NSTableView()
+    private let recentScroll = NSScrollView(), hotlistScroll = NSScrollView(), groupScroll = NSScrollView()
+    private var filteredRecent: [FolderEntry] = [], filteredHotlist: [FolderEntry] = [], filteredGroups: [FolderGroup] = [], selected: [FolderEntry] = []; private var flagsMonitor: Any?
+    private var editingGroupID: UUID?
+    private let backButton = NSButton(title: "‹", target: nil, action: nil)
     private let positionLabels = ["UR", "LR", "UL", "LL"]
     private let positionColors: [NSColor] = [.systemBlue, .systemGreen, .systemOrange, .systemPurple]
-    init(entries: [FolderEntry], hotlist: [FolderEntry], onHotlistChanged: @escaping ([FolderEntry]) -> Void, onOpen: @escaping ([String], Bool) -> Void, onClose: @escaping () -> Void) {
-        self.entries = entries; self.hotlist = hotlist; self.onHotlistChanged = onHotlistChanged; self.onOpen = onOpen; self.onClose = onClose
-        filteredRecent = entries; filteredHotlist = hotlist; super.init(nibName: nil, bundle: nil)
+    init(entries: [FolderEntry], hotlist: [FolderEntry], groups: [FolderGroup], onHotlistChanged: @escaping ([FolderEntry]) -> Void, onGroupsChanged: @escaping ([FolderGroup]) -> Void, onOpen: @escaping ([String], Bool) -> Void, onClose: @escaping () -> Void) {
+        self.entries = entries; self.hotlist = hotlist; self.groups = groups; self.onHotlistChanged = onHotlistChanged; self.onGroupsChanged = onGroupsChanged; self.onOpen = onOpen; self.onClose = onClose
+        filteredRecent = entries; filteredHotlist = hotlist; filteredGroups = groups; super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func loadView() {
         let card = NSVisualEffectView(); card.material = .popover; card.blendingMode = .behindWindow; card.state = .active; card.wantsLayer = true; card.layer?.cornerRadius = 16; card.layer?.masksToBounds = true; view = card
         search.placeholderString = "Search folders"; search.font = .systemFont(ofSize: 16); search.delegate = self; view.addSubview(search)
-        configure(hotlistTable, in: hotlistScroll); configure(recentTable, in: recentScroll)
-        let hotLabel = NSTextField(labelWithString: "HOTLIST"); let recentLabel = NSTextField(labelWithString: "RECENT")
-        for label in [hotLabel, recentLabel] { label.font = .systemFont(ofSize: 11, weight: .semibold); label.textColor = .secondaryLabelColor; view.addSubview(label); label.translatesAutoresizingMaskIntoConstraints = false }
+        configure(hotlistTable, in: hotlistScroll); configure(recentTable, in: recentScroll); configure(groupTable, in: groupScroll)
+        let hotLabel = NSTextField(labelWithString: "HOTLIST"); let recentLabel = NSTextField(labelWithString: "RECENT"); let groupLabel = NSTextField(labelWithString: "GROUPS")
+        for label in [hotLabel, recentLabel, groupLabel] { label.font = .systemFont(ofSize: 11, weight: .semibold); label.textColor = .secondaryLabelColor; view.addSubview(label); label.translatesAutoresizingMaskIntoConstraints = false }
+        backButton.target = self; backButton.action = #selector(backToGroups); backButton.isBordered = false; backButton.isHidden = true; view.addSubview(backButton); backButton.translatesAutoresizingMaskIntoConstraints = false
         let divider = NSBox(); divider.boxType = .separator; view.addSubview(divider)
-        for item in [search, hotlistScroll, recentScroll, divider] { item.translatesAutoresizingMaskIntoConstraints = false }
+        for item in [search, hotlistScroll, recentScroll, groupScroll, divider] { item.translatesAutoresizingMaskIntoConstraints = false }
         NSLayoutConstraint.activate([
             search.topAnchor.constraint(equalTo: view.topAnchor, constant: 14), search.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14), search.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             hotLabel.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 10), hotLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            recentLabel.topAnchor.constraint(equalTo: hotLabel.topAnchor), recentLabel.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 12),
-            divider.topAnchor.constraint(equalTo: hotLabel.topAnchor), divider.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10), divider.centerXAnchor.constraint(equalTo: view.centerXAnchor), divider.widthAnchor.constraint(equalToConstant: 1),
-            hotlistScroll.topAnchor.constraint(equalTo: hotLabel.bottomAnchor, constant: 5), hotlistScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8), hotlistScroll.trailingAnchor.constraint(equalTo: divider.leadingAnchor, constant: -6), hotlistScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
-            recentScroll.topAnchor.constraint(equalTo: recentLabel.bottomAnchor, constant: 5), recentScroll.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 6), recentScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8), recentScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8)
+            recentLabel.topAnchor.constraint(equalTo: hotLabel.topAnchor), recentLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 306), groupLabel.topAnchor.constraint(equalTo: hotLabel.topAnchor), groupLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 606),
+            backButton.centerYAnchor.constraint(equalTo: groupLabel.centerYAnchor), backButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 600), backButton.widthAnchor.constraint(equalToConstant: 24), backButton.heightAnchor.constraint(equalToConstant: 20),
+            divider.topAnchor.constraint(equalTo: hotLabel.topAnchor), divider.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10), divider.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 296), divider.widthAnchor.constraint(equalToConstant: 1),
+            hotlistScroll.topAnchor.constraint(equalTo: hotLabel.bottomAnchor, constant: 5), hotlistScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8), hotlistScroll.widthAnchor.constraint(equalToConstant: 280), hotlistScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
+            recentScroll.topAnchor.constraint(equalTo: recentLabel.bottomAnchor, constant: 5), recentScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 308), recentScroll.widthAnchor.constraint(equalToConstant: 280), recentScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
+            groupScroll.topAnchor.constraint(equalTo: groupLabel.bottomAnchor, constant: 5), groupScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 608), groupScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8), groupScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8)
         ])
     }
     private func configure(_ table: NSTableView, in scroll: NSScrollView) {
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder")); column.resizingMask = .autoresizingMask; table.addTableColumn(column); table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle; table.headerView = nil; table.rowHeight = 27; table.intercellSpacing = .zero; table.delegate = self; table.dataSource = self; table.target = self; table.action = #selector(rowReleased(_:)); table.allowsMultipleSelection = false; table.registerForDraggedTypes([folderPasteboardType]); table.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder")); column.resizingMask = .autoresizingMask; table.addTableColumn(column); table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle; table.headerView = nil; table.rowHeight = 27; table.intercellSpacing = .zero; table.delegate = self; table.dataSource = self; table.target = self; table.action = #selector(rowReleased(_:)); table.allowsMultipleSelection = false; table.registerForDraggedTypes([folderPasteboardType, groupPasteboardType]); table.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
         scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.scrollerStyle = .overlay; scroll.drawsBackground = false; view.addSubview(scroll)
     }
     override func viewDidAppear() {
@@ -267,11 +297,21 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     func controlTextDidChange(_ obj: Notification) { applyFilter() }
     private func applyFilter() {
         let q = search.stringValue.lowercased(), matches: (FolderEntry) -> Bool = { q.isEmpty || ($0.name + " " + $0.parent).lowercased().contains(q) }
-        filteredRecent = entries.filter(matches); filteredHotlist = hotlist.filter(matches); recentTable.reloadData(); hotlistTable.reloadData()
+        filteredRecent = entries.filter(matches); filteredHotlist = hotlist.filter(matches); filteredGroups = groups.filter { q.isEmpty || $0.name.lowercased().contains(q) }; recentTable.reloadData(); hotlistTable.reloadData(); groupTable.reloadData()
     }
     private func rows(for table: NSTableView) -> [FolderEntry] { table === hotlistTable ? filteredHotlist : filteredRecent }
-    func numberOfRows(in tableView: NSTableView) -> Int { rows(for: tableView).count }
+    func numberOfRows(in tableView: NSTableView) -> Int { if tableView === groupTable, let id = editingGroupID { return groups.first(where: { $0.id == id })?.folders.count ?? 0 }; return tableView === groupTable ? filteredGroups.count : rows(for: tableView).count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === groupTable {
+            if let id = editingGroupID, let group = groups.first(where: { $0.id == id }) {
+                let entry = group.folders[row], container = NSView(); let title = NSTextField(labelWithString: "\(positionLabels[row])  \(entry.name)"); title.font = .systemFont(ofSize: 13, weight: .medium); let parent = NSTextField(labelWithString: "— \(entry.parent)"); parent.font = .systemFont(ofSize: 11); parent.textColor = .secondaryLabelColor
+                for item in [title, parent] { container.addSubview(item); item.translatesAutoresizingMaskIntoConstraints = false }; NSLayoutConstraint.activate([title.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 9), title.centerYAnchor.constraint(equalTo: container.centerYAnchor), parent.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 5), parent.centerYAnchor.constraint(equalTo: container.centerYAnchor)]); return container
+            }
+            let group = filteredGroups[row], container = NSView(); let title = NSTextField(labelWithString: group.name); title.font = .systemFont(ofSize: 13, weight: .medium); let count = NSTextField(labelWithString: "\(group.folders.count)/4"); count.font = .systemFont(ofSize: 11); count.textColor = .secondaryLabelColor; let edit = NSButton(title: "Edit", target: self, action: #selector(editGroup(_:))); edit.tag = row; edit.bezelStyle = .inline; edit.font = .systemFont(ofSize: 11); let key = NSButton(title: "Key", target: self, action: #selector(groupHotkey(_:))); key.tag = row; key.bezelStyle = .inline; key.font = .systemFont(ofSize: 11); let delete = NSButton(title: "×", target: self, action: #selector(deleteGroup(_:))); delete.tag = row; delete.isBordered = false
+            for item in [title, count, edit, key, delete] { container.addSubview(item); item.translatesAutoresizingMaskIntoConstraints = false }
+            NSLayoutConstraint.activate([title.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 9), title.centerYAnchor.constraint(equalTo: container.centerYAnchor), count.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 6), count.centerYAnchor.constraint(equalTo: container.centerYAnchor), delete.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -3), delete.centerYAnchor.constraint(equalTo: container.centerYAnchor), edit.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -2), edit.centerYAnchor.constraint(equalTo: container.centerYAnchor), key.trailingAnchor.constraint(equalTo: edit.leadingAnchor, constant: -2), key.centerYAnchor.constraint(equalTo: container.centerYAnchor)])
+            return container
+        }
         let entry = rows(for: tableView)[row], container = NSView()
         let title = NSTextField(labelWithString: entry.name); title.font = .systemFont(ofSize: 13, weight: .medium); title.lineBreakMode = .byTruncatingTail
         let parent = NSTextField(labelWithString: "— \(entry.parent)"); parent.font = .systemFont(ofSize: 11); parent.textColor = .secondaryLabelColor; parent.lineBreakMode = .byTruncatingMiddle
@@ -286,9 +326,14 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
         parent.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -5).isActive = true
         return container
     }
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { let result = SelectionRowView(); if let position = selected.firstIndex(of: rows(for: tableView)[row]) { result.selectionColor = positionColors[position].withAlphaComponent(0.22) }; return result }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { let result = SelectionRowView(); if tableView !== groupTable, let position = selected.firstIndex(of: rows(for: tableView)[row]) { result.selectionColor = positionColors[position].withAlphaComponent(0.22) }; return result }
     @objc private func rowReleased(_ tableView: NSTableView) {
         let row = tableView.clickedRow
+        if tableView === groupTable {
+            if editingGroupID != nil { return }
+            guard row >= 0, filteredGroups.indices.contains(row) else { return }
+            if editingGroupID == nil { let paths = filteredGroups[row].folders.map(\.path); onOpen(paths, paths.count > 1) }; tableView.deselectAll(nil); return
+        }
         guard row >= 0, rows(for: tableView).indices.contains(row) else { return }
         let entry = rows(for: tableView)[row]
         if NSApp.currentEvent?.modifierFlags.contains(.command) == true { if let index = selected.firstIndex(of: entry) { selected.remove(at: index) } else if selected.count < 4 { selected.append(entry) }; recentTable.reloadData(); hotlistTable.reloadData() }
@@ -296,17 +341,27 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
         tableView.deselectAll(nil)
     }
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        guard rows(for: tableView).indices.contains(row) else { return nil }
-        let item = NSPasteboardItem(); item.setString(rows(for: tableView)[row].path, forType: folderPasteboardType); return item
+        if tableView === groupTable, editingGroupID == nil, filteredGroups.indices.contains(row) { let item = NSPasteboardItem(); item.setString(filteredGroups[row].id.uuidString, forType: groupPasteboardType); return item }
+        let path: String?
+        if tableView === groupTable, let id = editingGroupID { path = groups.first(where: { $0.id == id })?.folders[safe: row]?.path }
+        else { path = rows(for: tableView).indices.contains(row) ? rows(for: tableView)[row].path : nil }
+        guard let path else { return nil }; let item = NSPasteboardItem(); item.setString(path, forType: folderPasteboardType); return item
     }
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
-        guard tableView === hotlistTable, info.draggingPasteboard.string(forType: folderPasteboardType) != nil else { return [] }
-        tableView.setDropRow(row, dropOperation: .above)
-        let path = info.draggingPasteboard.string(forType: folderPasteboardType)!
-        return hotlist.contains(where: { $0.path == path }) ? .move : .copy
+        if tableView === groupTable, editingGroupID == nil, info.draggingPasteboard.string(forType: groupPasteboardType) != nil { tableView.setDropRow(row, dropOperation: .above); return .move }
+        guard tableView === hotlistTable || tableView === groupTable, info.draggingPasteboard.string(forType: folderPasteboardType) != nil else { return [] }
+        tableView.setDropRow(row, dropOperation: .above); return .copy
     }
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-        guard tableView === hotlistTable, let path = info.draggingPasteboard.string(forType: folderPasteboardType), let entry = hotlist.first(where: { $0.path == path }) ?? entries.first(where: { $0.path == path }) else { return false }
+        if tableView === groupTable, editingGroupID == nil, let idString = info.draggingPasteboard.string(forType: groupPasteboardType), let id = UUID(uuidString: idString), let source = groups.firstIndex(where: { $0.id == id }) {
+            let group = groups.remove(at: source); let target = min(row, groups.count); groups.insert(group, at: target); onGroupsChanged(groups); applyFilter(); return true
+        }
+        guard let path = info.draggingPasteboard.string(forType: folderPasteboardType), let entry = hotlist.first(where: { $0.path == path }) ?? entries.first(where: { $0.path == path }) else { return false }
+        if tableView === groupTable {
+            if let id = editingGroupID { guard var group = groups.first(where: { $0.id == id }), row <= group.folders.count else { return false }; group.folders.removeAll { $0.path == path }; group.folders.insert(entry, at: min(row, group.folders.count)); groups = groups.map { $0.id == id ? group : $0 }; onGroupsChanged(groups); groupTable.reloadData(); return true }
+            if filteredGroups.indices.contains(row) { var group = filteredGroups[row]; guard group.folders.count < 4, !group.folders.contains(where: { $0.path == path }) else { NSSound.beep(); return false }; group.folders.append(entry); groups = groups.map { $0.id == group.id ? group : $0 }; onGroupsChanged(groups); applyFilter(); return true }
+            let alert = NSAlert(); alert.messageText = "Name New Group"; alert.informativeText = "Choose a name for this folder group."; let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24)); alert.accessoryView = field; alert.addButton(withTitle: "Create"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }; groups.append(FolderGroup(id: UUID(), name: field.stringValue, folders: [entry], hotkeyCode: nil, hotkeyModifiers: 0)); onGroupsChanged(groups); applyFilter(); return true
+        }
         let targetPath = filteredHotlist.indices.contains(row) ? filteredHotlist[row].path : nil
         hotlist.removeAll { $0.path == path }
         let insertion = targetPath.flatMap { target in hotlist.firstIndex(where: { $0.path == target }) } ?? hotlist.endIndex
@@ -314,6 +369,11 @@ final class PopupController: NSViewController, NSTableViewDataSource, NSTableVie
     }
     @objc private func addHotlist(_ sender: NSButton) { guard filteredRecent.indices.contains(sender.tag) else { return }; let entry = filteredRecent[sender.tag]; if !hotlist.contains(where: { $0.path == entry.path }) { hotlist.append(entry); onHotlistChanged(hotlist); applyFilter() } }
     @objc private func removeHotlist(_ sender: NSButton) { guard filteredHotlist.indices.contains(sender.tag) else { return }; let entry = filteredHotlist[sender.tag]; hotlist.removeAll { $0.path == entry.path }; selected.removeAll { $0.path == entry.path }; onHotlistChanged(hotlist); applyFilter() }
+    @objc private func editGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; openGroupEditor(filteredGroups[sender.tag]) }
+    @objc private func deleteGroup(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Delete \(group.name)?"; alert.informativeText = "The folders will remain in Recent and Hotlist."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel"); guard alert.runModal() == .alertFirstButtonReturn else { return }; groups.removeAll { $0.id == group.id }; onGroupsChanged(groups); applyFilter() }
+    @objc private func groupHotkey(_ sender: NSButton) { guard filteredGroups.indices.contains(sender.tag) else { return }; let group = filteredGroups[sender.tag]; let alert = NSAlert(); alert.messageText = "Set Hotkey for \(group.name)"; alert.informativeText = "Press the shortcut you want to open this group."; let field = HotkeyField(frame: NSRect(x: 0, y: 0, width: 260, height: 28)); field.isEditable = false; field.isSelectable = false; field.stringValue = "Press a shortcut…"; alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field; guard alert.runModal() == .alertFirstButtonReturn, let event = field.event else { return }; let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue; let mainConflict = UserDefaults.standard.object(forKey: "hotkeyCode") != nil && UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) == event.keyCode && UInt(UserDefaults.standard.integer(forKey: "hotkeyModifiers")) == modifiers; let groupConflict = groups.contains { $0.id != group.id && $0.hotkeyCode == event.keyCode && $0.hotkeyModifiers == modifiers }; guard !mainConflict && !groupConflict else { NSAlert(error: NSError(domain: "FinderStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "That shortcut is already assigned to FinderStack or another group."])).runModal(); return }; groups = groups.map { var item = $0; if item.id == group.id { item.hotkeyCode = event.keyCode; item.hotkeyModifiers = modifiers }; return item }; onGroupsChanged(groups); applyFilter() }
+    private func openGroupEditor(_ group: FolderGroup) { editingGroupID = group.id; backButton.isHidden = false; groupTable.reloadData() }
+    @objc private func backToGroups() { editingGroupID = nil; backButton.isHidden = true; groupTable.reloadData() }
 }
 
 final class SelectionRowView: NSTableRowView {
