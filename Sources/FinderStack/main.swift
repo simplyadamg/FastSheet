@@ -55,6 +55,7 @@ final class Store {
     private var hotkeyMonitor: Any?
     private var localHotkeyMonitor: Any?
     private var carbonHotKey: EventHotKeyRef?
+    private var escapeHotKey: EventHotKeyRef?
     private var carbonHandler: EventHandlerRef?
     private var groupHotKeys: [UUID: EventHotKeyRef] = [:]
     private var hotkeyCode: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "hotkeyCode")) }
@@ -94,24 +95,28 @@ final class Store {
     }
 
     @objc private func toggle() {
-        if let panel, panel.isVisible { panel.close(); self.panel = nil } else { showPanel() }
+        if let panel, panel.isVisible { dismissPanel() } else { showPanel() }
     }
+
+    private func dismissPanel() { if let escapeHotKey { UnregisterEventHotKey(escapeHotKey); self.escapeHotKey = nil }; panel?.close(); panel = nil }
 
     private func showPanel() {
         let controller = PopupController(entries: store.entries, hotlist: store.hotlist, groups: store.groups, onHotlistChanged: { [weak self] items in self?.store.hotlist = items }, onGroupsChanged: { [weak self] items in self?.store.groups = items; self?.installCarbonHotkey() }) { [weak self] paths, isMultiSelection in
             guard let self else { return }
-            self.panel?.orderOut(nil); self.panel?.close(); self.panel = nil
+            self.dismissPanel()
             DispatchQueue.main.async {
                 if isMultiSelection { self.openFolderLayout(paths) }
                 else if let path = paths.first { self.openFolder(path) }
             }
-        } onClose: { [weak self] in self?.panel = nil }
-        let p = NSPanel(contentViewController: controller)
+        } onClose: { [weak self] in self?.dismissPanel() }
+        let p = PopupPanel(contentViewController: controller)
+        p.onCancel = { [weak self] in self?.toggle() }
         p.styleMask = [.borderless, .nonactivatingPanel]
         p.level = .floating; p.isFloatingPanel = true; p.hidesOnDeactivate = false
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.setContentSize(NSSize(width: 900, height: 500)); p.center(); p.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true); panel = p
+        registerEscapeHotkey()
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -233,7 +238,13 @@ final class Store {
         let paths = group.folders.map(\.path); if paths.count > 1 { openFolderLayout(paths) } else if let path = paths.first { openFolder(path) }; return true
     }
 
-    private func handleHotkey(_ id: UInt32) { if id == 1 { toggle() } }
+    private func handleHotkey(_ id: UInt32) { if id == 1 { toggle() } else if id == 2 { dismissPanel() } }
+
+    private func registerEscapeHotkey() {
+        if let escapeHotKey { UnregisterEventHotKey(escapeHotKey) }
+        var id = EventHotKeyID(signature: OSType(0x4653544B), id: 2); var ref: EventHotKeyRef?
+        RegisterEventHotKey(53, 0, id, GetApplicationEventTarget(), 0, &ref); escapeHotKey = ref
+    }
 
     private func carbonModifiers() -> UInt32 {
         let flags = hotkeyModifiers; var result: UInt32 = 0
@@ -251,6 +262,11 @@ final class HotkeyField: NSTextField {
     static func display(for event: NSEvent) -> String { modifierLabel(event.modifierFlags) + keyLabel(event) }
     private static func modifierLabel(_ flags: NSEvent.ModifierFlags) -> String { var s = ""; if flags.contains(.command) { s += "⌘" }; if flags.contains(.option) { s += "⌥" }; if flags.contains(.control) { s += "⌃" }; if flags.contains(.shift) { s += "⇧" }; return s }
     private static func keyLabel(_ event: NSEvent) -> String { switch event.keyCode { case 36: return "↩"; case 48: return "⇥"; case 49: return "Space"; case 51: return "⌫"; case 53: return "⎋"; case 122: return "F1"; case 120: return "F2"; case 99: return "F3"; case 118: return "F4"; case 96: return "F5"; case 97: return "F6"; case 98: return "F7"; case 100: return "F8"; case 101: return "F9"; case 109: return "F10"; case 103: return "F11"; case 111: return "F12"; default: return (event.charactersIgnoringModifiers ?? "").uppercased() } }
+}
+
+final class PopupPanel: NSPanel {
+    var onCancel: (() -> Void)?
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
 final class GroupTableView: NSTableView {
