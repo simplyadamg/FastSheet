@@ -428,6 +428,41 @@ struct CellSelection: Equatable {
     }
 }
 
+struct FormulaReferenceNavigator {
+    static func move(
+        current: CellSelection?,
+        startingAt start: CellPosition,
+        rowDelta: Int,
+        columnDelta: Int,
+        extending: Bool,
+        rowCount: Int,
+        columnCount: Int
+    ) -> CellSelection {
+        let currentPosition = current?.active ?? start
+        let destination = CellPosition(
+            row: min(max(0, currentPosition.row + rowDelta), rowCount - 1),
+            column: min(max(0, currentPosition.column + columnDelta), columnCount - 1)
+        )
+
+        if extending {
+            let anchor = current?.anchor ?? start
+            return CellSelection(anchor: anchor, active: destination)
+        }
+        return CellSelection(anchor: destination, active: destination)
+    }
+
+    static func referenceText(for selection: CellSelection) -> String {
+        let first = reference(row: selection.rows.lowerBound, column: selection.columns.lowerBound)
+        guard selection.rows.count > 1 || selection.columns.count > 1 else { return first }
+        let last = reference(row: selection.rows.upperBound, column: selection.columns.upperBound)
+        return "\(first):\(last)"
+    }
+
+    private static func reference(row: Int, column: Int) -> String {
+        "\(FormulaEngine.columnName(column))\(row + 1)"
+    }
+}
+
 struct FastSheetClipboardPayload: Codable, Equatable {
     let sourceRow: Int
     let sourceColumn: Int
@@ -479,7 +514,7 @@ final class FillHandleView: NSView {
 final class GridCellField: NSTextField {
     let row: Int
     let column: Int
-    var onSelect: ((GridCellField, Bool) -> Void)?
+    var onSelect: ((GridCellField, Bool) -> Bool)?
     var onBeginEditing: ((GridCellField, String?) -> Void)?
     var onNavigate: ((GridCellField, Int, Int, Bool, Bool) -> Void)?
     var onClear: ((GridCellField) -> Void)?
@@ -518,7 +553,11 @@ final class GridCellField: NSTextField {
             super.mouseDown(with: event)
             return
         }
-        onSelect?(self, event.modifierFlags.contains(.shift))
+        let handledAsFormulaReference = onSelect?(
+            self,
+            event.modifierFlags.contains(.shift)
+        ) == true
+        if handledAsFormulaReference { return }
         if event.clickCount >= 2 { onBeginEditing?(self, nil) }
         guard event.clickCount == 1, let window else { return }
         while let tracked = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
@@ -944,6 +983,11 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     private let tabs = NSStackView()
     private weak var selectedField: GridCellField?
     private var selection: CellSelection?
+    private weak var formulaEditingField: GridCellField?
+    private var formulaReferenceSelection: CellSelection?
+    private var formulaReferenceTextRange: NSRange?
+    private var formulaReferenceEditorText: String?
+    private var isApplyingFormulaReference = false
     private var history = WorkbookHistory()
 
     init(workbook: Workbook, save: @escaping (Workbook) -> Void) {
@@ -1048,7 +1092,12 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
             for field in row {
                 field.delegate = self
                 field.onSelect = { [weak self] field, extending in
-                    self?.selectCell(field, extending: extending)
+                    guard let self else { return false }
+                    if self.insertFormulaReferenceIfNeeded(to: field, extending: extending) {
+                        return true
+                    }
+                    self.selectCell(field, extending: extending)
+                    return false
                 }
                 field.onBeginEditing = { [weak self] field, replacement in
                     self?.beginEditing(field, replacingWith: replacement)
@@ -1110,11 +1159,32 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     func controlTextDidBeginEditing(_ notification: Notification) {
         guard let field = notification.object as? GridCellField else { return }
         if selectedField !== field { selectCell(field, extending: false) }
+        if formulaEditingField !== field {
+            resetFormulaReferenceEntry()
+            formulaEditingField = field
+        }
+        applySelectionAppearance()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? GridCellField,
+              field === formulaEditingField,
+              !isApplyingFormulaReference,
+              let editor = field.currentEditor() as? NSTextView,
+              editor.string != formulaReferenceEditorText
+        else { return }
+
+        formulaReferenceTextRange = nil
+        formulaReferenceEditorText = nil
+        if !editor.string.hasPrefix("=") {
+            formulaReferenceSelection = nil
+        }
         applySelectionAppearance()
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
         guard let field = notification.object as? GridCellField else { return }
+        resetFormulaReferenceEntry()
         save(field)
         field.isEditable = false
         field.isSelectable = false
@@ -1128,6 +1198,61 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         doCommandBy commandSelector: Selector
     ) -> Bool {
         guard let field = control as? GridCellField else { return false }
+
+        if field === formulaEditingField, textView.string.hasPrefix("=") {
+            switch commandSelector {
+            case #selector(NSResponder.moveLeft(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 0, columnDelta: -1)
+                return true
+            case #selector(NSResponder.moveRight(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 0, columnDelta: 1)
+                return true
+            case #selector(NSResponder.moveDown(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 1, columnDelta: 0)
+                return true
+            case #selector(NSResponder.moveUp(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: -1, columnDelta: 0)
+                return true
+            case #selector(NSResponder.moveLeftAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 0,
+                    columnDelta: -1,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveRightAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 0,
+                    columnDelta: 1,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveDownAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 1,
+                    columnDelta: 0,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveUpAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: -1,
+                    columnDelta: 0,
+                    extending: true
+                )
+                return true
+            default:
+                break
+            }
+        }
 
         switch commandSelector {
         case #selector(NSResponder.insertTab(_:)):
@@ -1161,6 +1286,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func beginEditing(_ field: GridCellField, replacingWith replacement: String?) {
+        resetFormulaReferenceEntry()
         selectCell(field, extending: false)
         let key = reference(row: field.row, column: field.column)
         let initialText = replacement ?? activeSheet.cells[key] ?? ""
@@ -1168,12 +1294,102 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         field.isEditable = true
         field.isSelectable = true
         field.selectText(nil)
-        DispatchQueue.main.async { [weak field] in
-            guard let field, let editor = field.currentEditor() as? NSTextView else { return }
+        formulaEditingField = field
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard let self, let field, let editor = field.currentEditor() as? NSTextView else { return }
             editor.allowsUndo = true
             editor.string = initialText
             editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+            self.formulaReferenceEditorText = nil
         }
+    }
+
+    private func moveFormulaReference(
+        from field: GridCellField,
+        in editor: NSTextView,
+        rowDelta: Int,
+        columnDelta: Int,
+        extending: Bool = false
+    ) {
+        let nextSelection = FormulaReferenceNavigator.move(
+            current: formulaReferenceSelection,
+            startingAt: CellPosition(row: field.row, column: field.column),
+            rowDelta: rowDelta,
+            columnDelta: columnDelta,
+            extending: extending,
+            rowCount: SpreadsheetGridView.rowCount,
+            columnCount: SpreadsheetGridView.columnCount
+        )
+        insertFormulaReference(nextSelection, into: editor, editingField: field)
+    }
+
+    private func insertFormulaReferenceIfNeeded(
+        to field: GridCellField,
+        extending: Bool
+    ) -> Bool {
+        guard let editingField = formulaEditingField,
+              editingField !== field,
+              let editor = editingField.currentEditor() as? NSTextView,
+              editor.string.hasPrefix("=")
+        else { return false }
+
+        let position = CellPosition(row: field.row, column: field.column)
+        let nextSelection: CellSelection
+        if extending, let formulaReferenceSelection {
+            nextSelection = formulaReferenceSelection.extending(to: position)
+        } else {
+            nextSelection = CellSelection(anchor: position, active: position)
+        }
+        insertFormulaReference(nextSelection, into: editor, editingField: editingField)
+        return true
+    }
+
+    private func insertFormulaReference(
+        _ referenceSelection: CellSelection,
+        into editor: NSTextView,
+        editingField: GridCellField
+    ) {
+        let currentLength = editor.string.utf16.count
+        let selectedRange = editor.selectedRange()
+        let savedRange = formulaReferenceTextRange
+        let replacementRange: NSRange
+        if let savedRange,
+           savedRange.location <= currentLength,
+           savedRange.location + savedRange.length <= currentLength {
+            replacementRange = savedRange
+        } else if selectedRange.location <= currentLength,
+                  selectedRange.location + selectedRange.length <= currentLength {
+            replacementRange = selectedRange
+        } else {
+            replacementRange = NSRange(location: currentLength, length: 0)
+        }
+
+        let referenceText = FormulaReferenceNavigator.referenceText(for: referenceSelection)
+        isApplyingFormulaReference = true
+        editor.insertText(referenceText, replacementRange: replacementRange)
+        let insertedRange = NSRange(location: replacementRange.location, length: referenceText.utf16.count)
+        editor.setSelectedRange(NSRange(location: NSMaxRange(insertedRange), length: 0))
+        editingField.stringValue = editor.string
+        isApplyingFormulaReference = false
+
+        formulaReferenceSelection = referenceSelection
+        formulaReferenceTextRange = insertedRange
+        formulaReferenceEditorText = editor.string
+        if let active = gridView.field(
+            row: referenceSelection.active.row,
+            column: referenceSelection.active.column
+        ) {
+            scrollFieldToVisible(active)
+        }
+        applySelectionAppearance()
+    }
+
+    private func resetFormulaReferenceEntry() {
+        formulaEditingField = nil
+        formulaReferenceSelection = nil
+        formulaReferenceTextRange = nil
+        formulaReferenceEditorText = nil
+        isApplyingFormulaReference = false
     }
 
     private func clearSelectedCells() {
@@ -1497,17 +1713,20 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func applySelectionAppearance() {
+        let displaySelection = formulaReferenceSelection ?? selection
         for row in gridView.fields {
             for field in row {
+                let position = CellPosition(row: field.row, column: field.column)
                 let isSelected = selection?.contains(row: field.row, column: field.column) == true
-                let isActive = selection?.active == CellPosition(row: field.row, column: field.column)
+                    || formulaReferenceSelection?.contains(row: field.row, column: field.column) == true
+                let isActive = displaySelection?.active == position
                 field.setSelectionState(selected: isSelected, active: isActive)
             }
         }
-        gridView.updateHeaderSelection(selection)
-        gridView.updateFillHandle(selection)
-        frozenColumnHeaders.update(selection: selection)
-        frozenRowHeaders.update(selection: selection)
+        gridView.updateHeaderSelection(displaySelection)
+        gridView.updateFillHandle(formulaReferenceSelection == nil ? selection : nil)
+        frozenColumnHeaders.update(selection: displaySelection)
+        frozenRowHeaders.update(selection: displaySelection)
     }
 
     private func jumpDestination(
