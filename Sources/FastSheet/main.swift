@@ -121,6 +121,50 @@ struct WorkbookHistory {
 
 // MARK: - Formula evaluation
 
+enum FormulaEvaluationError: Equatable {
+    case reference
+    case divisionByZero
+    case circularReference
+    case value
+    case unknownName
+    case number
+    case parse
+
+    var code: String {
+        switch self {
+        case .reference: "#REF!"
+        case .divisionByZero: "#DIV/0!"
+        case .circularReference: "#CIRC!"
+        case .value: "#VALUE!"
+        case .unknownName: "#NAME?"
+        case .number: "#NUM!"
+        case .parse: "#ERROR!"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .reference: "This formula contains an invalid cell reference."
+        case .divisionByZero: "This formula divides a value by zero."
+        case .circularReference: "This formula creates a circular reference."
+        case .value: "This formula uses a value that cannot be calculated."
+        case .unknownName: "This formula contains an unknown function or name."
+        case .number: "This formula produced a number outside the supported range."
+        case .parse: "This formula could not be parsed."
+        }
+    }
+
+    static func matching(code: String) -> FormulaEvaluationError? {
+        [reference, divisionByZero, circularReference, value, unknownName, number, parse]
+            .first { $0.code == code }
+    }
+}
+
+private enum FormulaEvaluation {
+    case number(Double)
+    case error(FormulaEvaluationError)
+}
+
 struct FormulaEngine {
     let cells: [String: String]
     private static let maximumSpreadsheetRows = 100
@@ -128,34 +172,67 @@ struct FormulaEngine {
     func displayValue(for reference: String) -> String {
         let raw = cells[reference.uppercased()] ?? ""
         guard raw.hasPrefix("=") else { return raw }
-        guard let number = numericValue(for: reference, visiting: []) else { return "" }
-        return Self.format(number)
+        switch evaluation(for: reference, visiting: []) {
+        case .number(let number):
+            return number.isFinite ? Self.format(number) : FormulaEvaluationError.number.code
+        case .error(let error):
+            return error.code
+        }
     }
 
-    private func numericValue(for reference: String, visiting: Set<String>) -> Double? {
+    private func evaluation(for reference: String, visiting: Set<String>) -> FormulaEvaluation {
         let key = reference.uppercased()
-        guard !visiting.contains(key) else { return nil }
-        guard let raw = cells[key], !raw.isEmpty else { return 0 }
+        guard !visiting.contains(key) else { return .error(.circularReference) }
+        guard let raw = cells[key], !raw.isEmpty else { return .number(0) }
         if !raw.hasPrefix("=") {
-            return Double(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard let number = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return .error(.value)
+            }
+            return .number(number)
+        }
+        guard !raw.uppercased().contains(FormulaEvaluationError.reference.code) else {
+            return .error(.reference)
         }
 
         var nextVisiting = visiting
         nextVisiting.insert(key)
         var parser = ExpressionParser(
             expression: String(raw.dropFirst()),
-            resolveCell: { cell in numericValue(for: cell, visiting: nextVisiting) },
+            resolveCell: { cell in evaluation(for: cell, visiting: nextVisiting) },
             resolveRange: { start, end in
-                references(in: start, through: end).compactMap {
-                    numericValue(for: $0, visiting: nextVisiting)
-                }
+                sumRange(from: start, through: end, visiting: nextVisiting)
             }
         )
         return parser.parse()
     }
 
-    private func references(in start: String, through end: String) -> [String] {
-        guard let a = Self.rangeCoordinates(for: start), let b = Self.rangeCoordinates(for: end) else { return [] }
+    private func sumRange(
+        from start: String,
+        through end: String,
+        visiting: Set<String>
+    ) -> FormulaEvaluation {
+        guard let references = references(in: start, through: end) else {
+            return .error(.reference)
+        }
+        var total = 0.0
+        for reference in references {
+            let raw = cells[reference.uppercased()] ?? ""
+            if !raw.hasPrefix("="), !raw.isEmpty,
+               Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == nil {
+                continue
+            }
+            switch evaluation(for: reference, visiting: visiting) {
+            case .number(let number): total += number
+            case .error(let error): return .error(error)
+            }
+        }
+        return .number(total)
+    }
+
+    private func references(in start: String, through end: String) -> [String]? {
+        guard let a = Self.rangeCoordinates(for: start), let b = Self.rangeCoordinates(for: end) else {
+            return nil
+        }
         let rowStart: Int
         let rowEnd: Int
         if a.row == nil, b.row == nil {
@@ -165,7 +242,7 @@ struct FormulaEngine {
             rowStart = min(firstRow, lastRow)
             rowEnd = max(firstRow, lastRow)
         } else {
-            return []
+            return nil
         }
         let rows = rowStart...rowEnd
         let columns = min(a.column, b.column)...max(a.column, b.column)
@@ -205,7 +282,7 @@ struct FormulaEngine {
     }
 
     static func format(_ value: Double) -> String {
-        guard value.isFinite else { return "" }
+        guard value.isFinite else { return FormulaEvaluationError.number.code }
         if value.rounded() == value { return String(Int(value)) }
         return String(format: "%.10g", value)
     }
@@ -469,66 +546,79 @@ struct SheetStructuralEditor {
 private struct ExpressionParser {
     let characters: [Character]
     var position = 0
-    let resolveCell: (String) -> Double?
-    let resolveRange: (String, String) -> [Double]
+    let resolveCell: (String) -> FormulaEvaluation
+    let resolveRange: (String, String) -> FormulaEvaluation
 
     init(
         expression: String,
-        resolveCell: @escaping (String) -> Double?,
-        resolveRange: @escaping (String, String) -> [Double]
+        resolveCell: @escaping (String) -> FormulaEvaluation,
+        resolveRange: @escaping (String, String) -> FormulaEvaluation
     ) {
         characters = Array(expression)
         self.resolveCell = resolveCell
         self.resolveRange = resolveRange
     }
 
-    mutating func parse() -> Double? {
-        guard let value = parseExpression() else { return nil }
+    mutating func parse() -> FormulaEvaluation {
+        let value = parseExpression()
+        if case .error = value { return value }
         skipSpaces()
-        return position == characters.count ? value : nil
+        return position == characters.count ? value : .error(.parse)
     }
 
-    private mutating func parseExpression() -> Double? {
-        guard var value = parseTerm() else { return nil }
+    private mutating func parseExpression() -> FormulaEvaluation {
+        let initial = parseTerm()
+        guard case .number(var value) = initial else { return initial }
         while true {
             skipSpaces()
             if consume("+") {
-                guard let rhs = parseTerm() else { return nil }
+                let result = parseTerm()
+                guard case .number(let rhs) = result else { return result }
                 value += rhs
             } else if consume("-") {
-                guard let rhs = parseTerm() else { return nil }
+                let result = parseTerm()
+                guard case .number(let rhs) = result else { return result }
                 value -= rhs
             } else {
-                return value
+                return finiteEvaluation(value)
             }
         }
     }
 
-    private mutating func parseTerm() -> Double? {
-        guard var value = parseFactor() else { return nil }
+    private mutating func parseTerm() -> FormulaEvaluation {
+        let initial = parseFactor()
+        guard case .number(var value) = initial else { return initial }
         while true {
             skipSpaces()
             if consume("*") {
-                guard let rhs = parseFactor() else { return nil }
+                let result = parseFactor()
+                guard case .number(let rhs) = result else { return result }
                 value *= rhs
             } else if consume("/") {
-                guard let rhs = parseFactor(), rhs != 0 else { return nil }
+                let result = parseFactor()
+                guard case .number(let rhs) = result else { return result }
+                guard rhs != 0 else { return .error(.divisionByZero) }
                 value /= rhs
             } else {
-                return value
+                return finiteEvaluation(value)
             }
         }
     }
 
-    private mutating func parseFactor() -> Double? {
+    private mutating func parseFactor() -> FormulaEvaluation {
         skipSpaces()
-        if consume("-") { return parseFactor().map { -$0 } }
-        if consume("(") {
-            guard let value = parseExpression() else { return nil }
-            skipSpaces()
-            return consume(")") ? value : nil
+        if consume("-") {
+            let result = parseFactor()
+            guard case .number(let value) = result else { return result }
+            return finiteEvaluation(-value)
         }
-        if let number = readNumber() { return number }
+        if consume("(") {
+            let value = parseExpression()
+            if case .error = value { return value }
+            skipSpaces()
+            return consume(")") ? value : .error(.parse)
+        }
+        if let number = readNumber() { return finiteEvaluation(number) }
 
         let referenceStart = position
         if let reference = readCellReference() {
@@ -536,24 +626,33 @@ private struct ExpressionParser {
         }
         position = referenceStart
 
-        guard let identifier = readIdentifier() else { return nil }
+        guard let identifier = readIdentifier() else { return .error(.parse) }
         if identifier.uppercased() == "SUM" {
             skipSpaces()
-            guard consume("("), let start = readRangeReference() else { return nil }
+            guard consume("("), let start = readRangeReference() else { return .error(.parse) }
             skipSpaces()
-            let values: [Double]
+            let result: FormulaEvaluation
             if consume(":") {
-                guard let end = readRangeReference() else { return nil }
-                values = resolveRange(start, end)
+                guard let end = readRangeReference() else { return .error(.parse) }
+                result = resolveRange(start, end)
             } else {
-                values = [resolveCell(start.replacingOccurrences(of: "$", with: "")) ?? 0]
+                let resolved = resolveCell(start.replacingOccurrences(of: "$", with: ""))
+                if case .error(.value) = resolved {
+                    result = .number(0)
+                } else {
+                    result = resolved
+                }
             }
             skipSpaces()
-            guard consume(")") else { return nil }
-            return values.reduce(0, +)
+            guard consume(")") else { return .error(.parse) }
+            return result
         }
 
-        return nil
+        return .error(.unknownName)
+    }
+
+    private func finiteEvaluation(_ value: Double) -> FormulaEvaluation {
+        value.isFinite ? .number(value) : .error(.number)
     }
 
     private mutating func readNumber() -> Double? {
@@ -1586,7 +1685,16 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         for row in gridView.fields {
             for field in row {
                 let key = reference(row: field.row, column: field.column)
-                field.stringValue = engine.displayValue(for: key)
+                let displayValue = engine.displayValue(for: key)
+                field.stringValue = displayValue
+                if sheet.cells[key]?.hasPrefix("=") == true,
+                   let error = FormulaEvaluationError.matching(code: displayValue) {
+                    field.textColor = .systemRed
+                    field.toolTip = error.message
+                } else {
+                    field.textColor = .labelColor
+                    field.toolTip = nil
+                }
             }
         }
         applySelectionAppearance()
@@ -1782,6 +1890,8 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         let key = reference(row: field.row, column: field.column)
         let initialText = replacement ?? activeSheet.cells[key] ?? ""
         field.stringValue = initialText
+        field.textColor = .labelColor
+        field.toolTip = nil
         field.isEditable = true
         field.isSelectable = true
         field.selectText(nil)

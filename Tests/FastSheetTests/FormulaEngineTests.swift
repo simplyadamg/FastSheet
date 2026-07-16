@@ -36,14 +36,44 @@ final class FormulaEngineTests: XCTestCase {
         XCTAssertEqual(engine.displayValue(for: "B7"), "9")
     }
 
-    func testInvalidAndCircularFormulasAreBlank() {
+    func testInvalidAndCircularFormulasShowErrors() {
         let engine = FormulaEngine(cells: [
             "A1": "=B1",
             "B1": "=A1",
             "C1": "=NOT_A_FORMULA"
         ])
-        XCTAssertEqual(engine.displayValue(for: "A1"), "")
-        XCTAssertEqual(engine.displayValue(for: "C1"), "")
+        XCTAssertEqual(engine.displayValue(for: "A1"), "#CIRC!")
+        XCTAssertEqual(engine.displayValue(for: "C1"), "#NAME?")
+    }
+
+    func testFormulaErrorsAreSpecificAndPropagateToDependents() {
+        let engine = FormulaEngine(cells: [
+            "A1": "=1/0",
+            "A2": "=A1+2",
+            "B1": "=#REF!",
+            "B2": "=1+",
+            "C1": "words",
+            "C2": "=C1+1"
+        ])
+
+        XCTAssertEqual(engine.displayValue(for: "A1"), "#DIV/0!")
+        XCTAssertEqual(engine.displayValue(for: "A2"), "#DIV/0!")
+        XCTAssertEqual(engine.displayValue(for: "B1"), "#REF!")
+        XCTAssertEqual(engine.displayValue(for: "B2"), "#ERROR!")
+        XCTAssertEqual(engine.displayValue(for: "C2"), "#VALUE!")
+    }
+
+    func testSumIgnoresPlainTextButPropagatesFormulaErrors() {
+        let engine = FormulaEngine(cells: [
+            "A1": "2",
+            "A2": "words",
+            "A3": "=1/0",
+            "B1": "=SUM(A1:A2)",
+            "B2": "=SUM(A1:A3)"
+        ])
+
+        XCTAssertEqual(engine.displayValue(for: "B1"), "2")
+        XCTAssertEqual(engine.displayValue(for: "B2"), "#DIV/0!")
     }
 
     func testColumnNamesAndCoordinates() {
