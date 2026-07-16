@@ -586,6 +586,216 @@ class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+@MainActor
+struct FrozenHeaderGeometry {
+    static func columnFrame(_ column: Int, horizontalOffset: CGFloat) -> NSRect {
+        NSRect(
+            x: SpreadsheetGridView.rowHeaderWidth
+                + CGFloat(column) * SpreadsheetGridView.cellWidth
+                - horizontalOffset,
+            y: 0,
+            width: SpreadsheetGridView.cellWidth,
+            height: SpreadsheetGridView.columnHeaderHeight
+        )
+    }
+
+    static func rowFrame(_ row: Int, verticalOffset: CGFloat) -> NSRect {
+        NSRect(
+            x: 0,
+            y: CGFloat(row) * SpreadsheetGridView.cellHeight - verticalOffset,
+            width: SpreadsheetGridView.rowHeaderWidth,
+            height: SpreadsheetGridView.cellHeight
+        )
+    }
+
+    static func column(at viewX: CGFloat, horizontalOffset: CGFloat) -> Int? {
+        let documentX = viewX + horizontalOffset
+        let column = Int(floor(
+            (documentX - SpreadsheetGridView.rowHeaderWidth) / SpreadsheetGridView.cellWidth
+        ))
+        return (0..<SpreadsheetGridView.columnCount).contains(column) ? column : nil
+    }
+
+    static func row(at viewY: CGFloat, verticalOffset: CGFloat) -> Int? {
+        let row = Int(floor((viewY + verticalOffset) / SpreadsheetGridView.cellHeight))
+        return (0..<SpreadsheetGridView.rowCount).contains(row) ? row : nil
+    }
+
+    static func scrollOrigin(revealing frame: NSRect, within visible: NSRect) -> NSPoint {
+        var origin = visible.origin
+
+        let leftEdge = origin.x + SpreadsheetGridView.rowHeaderWidth
+        if frame.minX < leftEdge {
+            origin.x = frame.minX - SpreadsheetGridView.rowHeaderWidth
+        } else if frame.maxX > visible.maxX {
+            origin.x = frame.maxX - visible.width
+        }
+
+        let topEdge = origin.y + SpreadsheetGridView.columnHeaderHeight
+        if frame.minY < topEdge {
+            origin.y = frame.minY - SpreadsheetGridView.columnHeaderHeight
+        } else if frame.maxY > visible.maxY {
+            origin.y = frame.maxY - visible.height
+        }
+
+        origin.x = max(0, origin.x)
+        origin.y = max(0, origin.y)
+        return origin
+    }
+}
+
+final class HeaderTrackingScrollView: NSScrollView {
+    var onScroll: (() -> Void)?
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        onScroll?()
+    }
+}
+
+final class FrozenHeaderView: FlippedView {
+    enum Axis {
+        case columns
+        case rows
+    }
+
+    let axis: Axis
+    weak var scrollView: NSScrollView?
+    var selection: CellSelection?
+    var onSelectRow: ((Int) -> Void)?
+    var onSelectColumn: ((Int) -> Void)?
+    var onSelectAll: (() -> Void)?
+
+    init(axis: Axis) {
+        self.axis = axis
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: bounds).addClip()
+
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
+
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            drawColumnHeaders(horizontalOffset: offset.x)
+        case .rows:
+            drawRowHeaders(verticalOffset: offset.y)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            if point.x < SpreadsheetGridView.rowHeaderWidth {
+                onSelectAll?()
+            } else if let column = FrozenHeaderGeometry.column(
+                at: point.x,
+                horizontalOffset: offset.x
+            ) {
+                onSelectColumn?(column)
+            }
+        case .rows:
+            if let row = FrozenHeaderGeometry.row(at: point.y, verticalOffset: offset.y) {
+                onSelectRow?(row)
+            }
+        }
+    }
+
+    func update(selection: CellSelection?) {
+        self.selection = selection
+        needsDisplay = true
+    }
+
+    private func drawColumnHeaders(horizontalOffset: CGFloat) {
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: NSRect(
+            x: SpreadsheetGridView.rowHeaderWidth,
+            y: 0,
+            width: max(0, bounds.width - SpreadsheetGridView.rowHeaderWidth),
+            height: bounds.height
+        )).addClip()
+
+        for column in 0..<SpreadsheetGridView.columnCount {
+            let frame = FrozenHeaderGeometry.columnFrame(column, horizontalOffset: horizontalOffset)
+            guard frame.intersects(bounds) else { continue }
+            drawHeader(
+                FormulaEngine.columnName(column),
+                in: frame,
+                alignment: .center,
+                selected: selection?.columns.contains(column) == true
+            )
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let selectsAll = selection?.rows == 0...(SpreadsheetGridView.rowCount - 1)
+            && selection?.columns == 0...(SpreadsheetGridView.columnCount - 1)
+        drawHeader(
+            "",
+            in: NSRect(
+                x: 0,
+                y: 0,
+                width: SpreadsheetGridView.rowHeaderWidth,
+                height: SpreadsheetGridView.columnHeaderHeight
+            ),
+            alignment: .center,
+            selected: selectsAll
+        )
+    }
+
+    private func drawRowHeaders(verticalOffset: CGFloat) {
+        for row in 0..<SpreadsheetGridView.rowCount {
+            let frame = FrozenHeaderGeometry.rowFrame(row, verticalOffset: verticalOffset)
+            guard frame.intersects(bounds) else { continue }
+            drawHeader(
+                String(row + 1),
+                in: frame,
+                alignment: .right,
+                selected: selection?.rows.contains(row) == true
+            )
+        }
+    }
+
+    private func drawHeader(
+        _ text: String,
+        in frame: NSRect,
+        alignment: NSTextAlignment,
+        selected: Bool
+    ) {
+        let background = selected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.windowBackgroundColor
+        background.setFill()
+        frame.fill()
+
+        NSColor.separatorColor.setStroke()
+        let border = NSBezierPath(rect: frame.integral)
+        border.lineWidth = 1
+        border.stroke()
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: selected ? NSColor.labelColor : NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+        (text as NSString).draw(
+            in: frame.insetBy(dx: alignment == .right ? 6 : 3, dy: 6),
+            withAttributes: attributes
+        )
+    }
+}
+
 final class SpreadsheetGridView: FlippedView {
     static let rowCount = 100
     static let columnCount = 26
@@ -727,8 +937,10 @@ final class FastSheetPanel: NSPanel {
 final class SheetController: NSViewController, NSTextFieldDelegate {
     private var workbook: Workbook
     private let saveWorkbook: (Workbook) -> Void
-    private let scrollView = NSScrollView()
+    private let scrollView = HeaderTrackingScrollView()
     private let gridView = SpreadsheetGridView(frame: .zero)
+    private let frozenColumnHeaders = FrozenHeaderView(axis: .columns)
+    private let frozenRowHeaders = FrozenHeaderView(axis: .rows)
     private let tabs = NSStackView()
     private weak var selectedField: GridCellField?
     private var selection: CellSelection?
@@ -789,6 +1001,14 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
 
+        frozenColumnHeaders.scrollView = scrollView
+        frozenRowHeaders.scrollView = scrollView
+        frozenColumnHeaders.translatesAutoresizingMaskIntoConstraints = false
+        frozenRowHeaders.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(frozenColumnHeaders)
+        view.addSubview(frozenRowHeaders)
+        scrollView.onScroll = { [weak self] in self?.refreshFrozenHeaders() }
+
         tabs.orientation = .horizontal
         tabs.alignment = .centerY
         tabs.spacing = 4
@@ -805,6 +1025,18 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             scrollView.bottomAnchor.constraint(equalTo: tabs.topAnchor, constant: -7),
+
+            frozenColumnHeaders.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            frozenColumnHeaders.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            frozenColumnHeaders.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            frozenColumnHeaders.heightAnchor.constraint(
+                equalToConstant: SpreadsheetGridView.columnHeaderHeight
+            ),
+
+            frozenRowHeaders.topAnchor.constraint(equalTo: frozenColumnHeaders.bottomAnchor),
+            frozenRowHeaders.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            frozenRowHeaders.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+            frozenRowHeaders.widthAnchor.constraint(equalToConstant: SpreadsheetGridView.rowHeaderWidth),
 
             tabs.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             tabs.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -8),
@@ -843,6 +1075,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         gridView.onSelectColumn = { [weak self] column in self?.selectColumn(column) }
         gridView.onSelectAll = { [weak self] in self?.selectAllCells() }
         gridView.onFillHandleDrag = { [weak self] point in self?.fillSelection(toWindowPoint: point) }
+        frozenColumnHeaders.onSelectColumn = { [weak self] column in self?.selectColumn(column) }
+        frozenColumnHeaders.onSelectAll = { [weak self] in self?.selectAllCells() }
+        frozenRowHeaders.onSelectRow = { [weak self] row in self?.selectRow(row) }
     }
 
     private var activeSheet: Sheet { workbook.sheets[workbook.activeSheetIndex] }
@@ -1271,6 +1506,8 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         }
         gridView.updateHeaderSelection(selection)
         gridView.updateFillHandle(selection)
+        frozenColumnHeaders.update(selection: selection)
+        frozenRowHeaders.update(selection: selection)
     }
 
     private func jumpDestination(
@@ -1302,8 +1539,18 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func scrollFieldToVisible(_ field: GridCellField) {
-        gridView.scrollToVisible(field.frame.insetBy(dx: -4, dy: -4))
+        let clipView = scrollView.contentView
+        let visible = clipView.bounds
+        let fieldFrame = field.frame.insetBy(dx: -4, dy: -4)
+        let origin = FrozenHeaderGeometry.scrollOrigin(revealing: fieldFrame, within: visible)
+        clipView.scroll(to: origin)
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        refreshFrozenHeaders()
+    }
+
+    private func refreshFrozenHeaders() {
+        frozenColumnHeaders.needsDisplay = true
+        frozenRowHeaders.needsDisplay = true
     }
 
     private func persist() {
