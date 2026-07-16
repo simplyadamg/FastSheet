@@ -428,6 +428,41 @@ struct CellSelection: Equatable {
     }
 }
 
+struct FormulaReferenceNavigator {
+    static func move(
+        current: CellSelection?,
+        startingAt start: CellPosition,
+        rowDelta: Int,
+        columnDelta: Int,
+        extending: Bool,
+        rowCount: Int,
+        columnCount: Int
+    ) -> CellSelection {
+        let currentPosition = current?.active ?? start
+        let destination = CellPosition(
+            row: min(max(0, currentPosition.row + rowDelta), rowCount - 1),
+            column: min(max(0, currentPosition.column + columnDelta), columnCount - 1)
+        )
+
+        if extending {
+            let anchor = current?.anchor ?? start
+            return CellSelection(anchor: anchor, active: destination)
+        }
+        return CellSelection(anchor: destination, active: destination)
+    }
+
+    static func referenceText(for selection: CellSelection) -> String {
+        let first = reference(row: selection.rows.lowerBound, column: selection.columns.lowerBound)
+        guard selection.rows.count > 1 || selection.columns.count > 1 else { return first }
+        let last = reference(row: selection.rows.upperBound, column: selection.columns.upperBound)
+        return "\(first):\(last)"
+    }
+
+    private static func reference(row: Int, column: Int) -> String {
+        "\(FormulaEngine.columnName(column))\(row + 1)"
+    }
+}
+
 struct FastSheetClipboardPayload: Codable, Equatable {
     let sourceRow: Int
     let sourceColumn: Int
@@ -479,7 +514,7 @@ final class FillHandleView: NSView {
 final class GridCellField: NSTextField {
     let row: Int
     let column: Int
-    var onSelect: ((GridCellField, Bool) -> Void)?
+    var onSelect: ((GridCellField, Bool) -> Bool)?
     var onBeginEditing: ((GridCellField, String?) -> Void)?
     var onNavigate: ((GridCellField, Int, Int, Bool, Bool) -> Void)?
     var onClear: ((GridCellField) -> Void)?
@@ -518,7 +553,11 @@ final class GridCellField: NSTextField {
             super.mouseDown(with: event)
             return
         }
-        onSelect?(self, event.modifierFlags.contains(.shift))
+        let handledAsFormulaReference = onSelect?(
+            self,
+            event.modifierFlags.contains(.shift)
+        ) == true
+        if handledAsFormulaReference { return }
         if event.clickCount >= 2 { onBeginEditing?(self, nil) }
         guard event.clickCount == 1, let window else { return }
         while let tracked = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
@@ -584,6 +623,216 @@ final class GridCellField: NSTextField {
 
 class FlippedView: NSView {
     override var isFlipped: Bool { true }
+}
+
+@MainActor
+struct FrozenHeaderGeometry {
+    static func columnFrame(_ column: Int, horizontalOffset: CGFloat) -> NSRect {
+        NSRect(
+            x: SpreadsheetGridView.rowHeaderWidth
+                + CGFloat(column) * SpreadsheetGridView.cellWidth
+                - horizontalOffset,
+            y: 0,
+            width: SpreadsheetGridView.cellWidth,
+            height: SpreadsheetGridView.columnHeaderHeight
+        )
+    }
+
+    static func rowFrame(_ row: Int, verticalOffset: CGFloat) -> NSRect {
+        NSRect(
+            x: 0,
+            y: CGFloat(row) * SpreadsheetGridView.cellHeight - verticalOffset,
+            width: SpreadsheetGridView.rowHeaderWidth,
+            height: SpreadsheetGridView.cellHeight
+        )
+    }
+
+    static func column(at viewX: CGFloat, horizontalOffset: CGFloat) -> Int? {
+        let documentX = viewX + horizontalOffset
+        let column = Int(floor(
+            (documentX - SpreadsheetGridView.rowHeaderWidth) / SpreadsheetGridView.cellWidth
+        ))
+        return (0..<SpreadsheetGridView.columnCount).contains(column) ? column : nil
+    }
+
+    static func row(at viewY: CGFloat, verticalOffset: CGFloat) -> Int? {
+        let row = Int(floor((viewY + verticalOffset) / SpreadsheetGridView.cellHeight))
+        return (0..<SpreadsheetGridView.rowCount).contains(row) ? row : nil
+    }
+
+    static func scrollOrigin(revealing frame: NSRect, within visible: NSRect) -> NSPoint {
+        var origin = visible.origin
+
+        let leftEdge = origin.x + SpreadsheetGridView.rowHeaderWidth
+        if frame.minX < leftEdge {
+            origin.x = frame.minX - SpreadsheetGridView.rowHeaderWidth
+        } else if frame.maxX > visible.maxX {
+            origin.x = frame.maxX - visible.width
+        }
+
+        let topEdge = origin.y + SpreadsheetGridView.columnHeaderHeight
+        if frame.minY < topEdge {
+            origin.y = frame.minY - SpreadsheetGridView.columnHeaderHeight
+        } else if frame.maxY > visible.maxY {
+            origin.y = frame.maxY - visible.height
+        }
+
+        origin.x = max(0, origin.x)
+        origin.y = max(0, origin.y)
+        return origin
+    }
+}
+
+final class HeaderTrackingScrollView: NSScrollView {
+    var onScroll: (() -> Void)?
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        onScroll?()
+    }
+}
+
+final class FrozenHeaderView: FlippedView {
+    enum Axis {
+        case columns
+        case rows
+    }
+
+    let axis: Axis
+    weak var scrollView: NSScrollView?
+    var selection: CellSelection?
+    var onSelectRow: ((Int) -> Void)?
+    var onSelectColumn: ((Int) -> Void)?
+    var onSelectAll: (() -> Void)?
+
+    init(axis: Axis) {
+        self.axis = axis
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: bounds).addClip()
+
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
+
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            drawColumnHeaders(horizontalOffset: offset.x)
+        case .rows:
+            drawRowHeaders(verticalOffset: offset.y)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            if point.x < SpreadsheetGridView.rowHeaderWidth {
+                onSelectAll?()
+            } else if let column = FrozenHeaderGeometry.column(
+                at: point.x,
+                horizontalOffset: offset.x
+            ) {
+                onSelectColumn?(column)
+            }
+        case .rows:
+            if let row = FrozenHeaderGeometry.row(at: point.y, verticalOffset: offset.y) {
+                onSelectRow?(row)
+            }
+        }
+    }
+
+    func update(selection: CellSelection?) {
+        self.selection = selection
+        needsDisplay = true
+    }
+
+    private func drawColumnHeaders(horizontalOffset: CGFloat) {
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: NSRect(
+            x: SpreadsheetGridView.rowHeaderWidth,
+            y: 0,
+            width: max(0, bounds.width - SpreadsheetGridView.rowHeaderWidth),
+            height: bounds.height
+        )).addClip()
+
+        for column in 0..<SpreadsheetGridView.columnCount {
+            let frame = FrozenHeaderGeometry.columnFrame(column, horizontalOffset: horizontalOffset)
+            guard frame.intersects(bounds) else { continue }
+            drawHeader(
+                FormulaEngine.columnName(column),
+                in: frame,
+                alignment: .center,
+                selected: selection?.columns.contains(column) == true
+            )
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let selectsAll = selection?.rows == 0...(SpreadsheetGridView.rowCount - 1)
+            && selection?.columns == 0...(SpreadsheetGridView.columnCount - 1)
+        drawHeader(
+            "",
+            in: NSRect(
+                x: 0,
+                y: 0,
+                width: SpreadsheetGridView.rowHeaderWidth,
+                height: SpreadsheetGridView.columnHeaderHeight
+            ),
+            alignment: .center,
+            selected: selectsAll
+        )
+    }
+
+    private func drawRowHeaders(verticalOffset: CGFloat) {
+        for row in 0..<SpreadsheetGridView.rowCount {
+            let frame = FrozenHeaderGeometry.rowFrame(row, verticalOffset: verticalOffset)
+            guard frame.intersects(bounds) else { continue }
+            drawHeader(
+                String(row + 1),
+                in: frame,
+                alignment: .right,
+                selected: selection?.rows.contains(row) == true
+            )
+        }
+    }
+
+    private func drawHeader(
+        _ text: String,
+        in frame: NSRect,
+        alignment: NSTextAlignment,
+        selected: Bool
+    ) {
+        let background = selected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.windowBackgroundColor
+        background.setFill()
+        frame.fill()
+
+        NSColor.separatorColor.setStroke()
+        let border = NSBezierPath(rect: frame.integral)
+        border.lineWidth = 1
+        border.stroke()
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: selected ? NSColor.labelColor : NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+        (text as NSString).draw(
+            in: frame.insetBy(dx: alignment == .right ? 6 : 3, dy: 6),
+            withAttributes: attributes
+        )
+    }
 }
 
 final class SpreadsheetGridView: FlippedView {
@@ -727,11 +976,20 @@ final class FastSheetPanel: NSPanel {
 final class SheetController: NSViewController, NSTextFieldDelegate {
     private var workbook: Workbook
     private let saveWorkbook: (Workbook) -> Void
-    private let scrollView = NSScrollView()
+    private let scrollView = HeaderTrackingScrollView()
     private let gridView = SpreadsheetGridView(frame: .zero)
+    private let frozenColumnHeaders = FrozenHeaderView(axis: .columns)
+    private let frozenRowHeaders = FrozenHeaderView(axis: .rows)
+    private let cellReferenceField = NSTextField(frame: .zero)
+    private let formulaBar = NSTextField(frame: .zero)
     private let tabs = NSStackView()
     private weak var selectedField: GridCellField?
     private var selection: CellSelection?
+    private weak var formulaEditingField: GridCellField?
+    private var formulaReferenceSelection: CellSelection?
+    private var formulaReferenceTextRange: NSRange?
+    private var formulaReferenceEditorText: String?
+    private var isApplyingFormulaReference = false
     private var history = WorkbookHistory()
 
     init(workbook: Workbook, save: @escaping (Workbook) -> Void) {
@@ -763,23 +1021,30 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func buildInterface() {
-        let title = NSTextField(labelWithString: "FastSheet")
-        title.font = .systemFont(ofSize: 16, weight: .semibold)
-
-        let hint = NSTextField(labelWithString: "Enter values or formulas, e.g. =A1+B1 or =SUM(A1:A10)")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-
         let addSheetButton = NSButton(title: "+", target: self, action: #selector(addSheet))
         addSheetButton.toolTip = "New sheet"
         addSheetButton.bezelStyle = .texturedRounded
 
-        let header = NSStackView(views: [title, hint, NSView(), addSheetButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 10
-        header.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(header)
+        cellReferenceField.isEditable = false
+        cellReferenceField.isSelectable = false
+        cellReferenceField.isBezeled = true
+        cellReferenceField.alignment = .center
+        cellReferenceField.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        cellReferenceField.placeholderString = "Cell"
+
+        formulaBar.delegate = self
+        formulaBar.isEditable = true
+        formulaBar.isSelectable = true
+        formulaBar.isBezeled = true
+        formulaBar.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        formulaBar.placeholderString = "Enter a value or formula"
+
+        let formulaRow = NSStackView(views: [cellReferenceField, formulaBar, addSheetButton])
+        formulaRow.orientation = .horizontal
+        formulaRow.alignment = .centerY
+        formulaRow.spacing = 6
+        formulaRow.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(formulaRow)
 
         scrollView.documentView = gridView
         scrollView.hasHorizontalScroller = true
@@ -789,6 +1054,14 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
 
+        frozenColumnHeaders.scrollView = scrollView
+        frozenRowHeaders.scrollView = scrollView
+        frozenColumnHeaders.translatesAutoresizingMaskIntoConstraints = false
+        frozenRowHeaders.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(frozenColumnHeaders)
+        view.addSubview(frozenRowHeaders)
+        scrollView.onScroll = { [weak self] in self?.refreshFrozenHeaders() }
+
         tabs.orientation = .horizontal
         tabs.alignment = .centerY
         tabs.spacing = 4
@@ -796,15 +1069,28 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         view.addSubview(tabs)
 
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
-            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            header.heightAnchor.constraint(equalToConstant: 24),
+            formulaRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
+            formulaRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            formulaRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            formulaRow.heightAnchor.constraint(equalToConstant: 24),
+            cellReferenceField.widthAnchor.constraint(equalToConstant: 72),
 
-            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            scrollView.topAnchor.constraint(equalTo: formulaRow.bottomAnchor, constant: 6),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             scrollView.bottomAnchor.constraint(equalTo: tabs.topAnchor, constant: -7),
+
+            frozenColumnHeaders.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            frozenColumnHeaders.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            frozenColumnHeaders.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            frozenColumnHeaders.heightAnchor.constraint(
+                equalToConstant: SpreadsheetGridView.columnHeaderHeight
+            ),
+
+            frozenRowHeaders.topAnchor.constraint(equalTo: frozenColumnHeaders.bottomAnchor),
+            frozenRowHeaders.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            frozenRowHeaders.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+            frozenRowHeaders.widthAnchor.constraint(equalToConstant: SpreadsheetGridView.rowHeaderWidth),
 
             tabs.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             tabs.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -8),
@@ -816,7 +1102,12 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
             for field in row {
                 field.delegate = self
                 field.onSelect = { [weak self] field, extending in
-                    self?.selectCell(field, extending: extending)
+                    guard let self else { return false }
+                    if self.insertFormulaReferenceIfNeeded(to: field, extending: extending) {
+                        return true
+                    }
+                    self.selectCell(field, extending: extending)
+                    return false
                 }
                 field.onBeginEditing = { [weak self] field, replacement in
                     self?.beginEditing(field, replacingWith: replacement)
@@ -843,6 +1134,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         gridView.onSelectColumn = { [weak self] column in self?.selectColumn(column) }
         gridView.onSelectAll = { [weak self] in self?.selectAllCells() }
         gridView.onFillHandleDrag = { [weak self] point in self?.fillSelection(toWindowPoint: point) }
+        frozenColumnHeaders.onSelectColumn = { [weak self] column in self?.selectColumn(column) }
+        frozenColumnHeaders.onSelectAll = { [weak self] in self?.selectAllCells() }
+        frozenRowHeaders.onSelectRow = { [weak self] row in self?.selectRow(row) }
     }
 
     private var activeSheet: Sheet { workbook.sheets[workbook.activeSheetIndex] }
@@ -875,11 +1169,40 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     func controlTextDidBeginEditing(_ notification: Notification) {
         guard let field = notification.object as? GridCellField else { return }
         if selectedField !== field { selectCell(field, extending: false) }
+        if formulaEditingField !== field {
+            resetFormulaReferenceEntry()
+            formulaEditingField = field
+        }
+        applySelectionAppearance()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        if let editedField = notification.object as? NSTextField, editedField === formulaBar {
+            return
+        }
+        guard let field = notification.object as? GridCellField,
+              field === formulaEditingField,
+              !isApplyingFormulaReference,
+              let editor = field.currentEditor() as? NSTextView,
+              editor.string != formulaReferenceEditorText
+        else { return }
+
+        formulaReferenceTextRange = nil
+        formulaReferenceEditorText = nil
+        formulaBar.stringValue = editor.string
+        if !editor.string.hasPrefix("=") {
+            formulaReferenceSelection = nil
+        }
         applySelectionAppearance()
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
+        if let editedField = notification.object as? NSTextField, editedField === formulaBar {
+            commitFormulaBar()
+            return
+        }
         guard let field = notification.object as? GridCellField else { return }
+        resetFormulaReferenceEntry()
         save(field)
         field.isEditable = false
         field.isSelectable = false
@@ -893,6 +1216,61 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         doCommandBy commandSelector: Selector
     ) -> Bool {
         guard let field = control as? GridCellField else { return false }
+
+        if field === formulaEditingField, textView.string.hasPrefix("=") {
+            switch commandSelector {
+            case #selector(NSResponder.moveLeft(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 0, columnDelta: -1)
+                return true
+            case #selector(NSResponder.moveRight(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 0, columnDelta: 1)
+                return true
+            case #selector(NSResponder.moveDown(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: 1, columnDelta: 0)
+                return true
+            case #selector(NSResponder.moveUp(_:)):
+                moveFormulaReference(from: field, in: textView, rowDelta: -1, columnDelta: 0)
+                return true
+            case #selector(NSResponder.moveLeftAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 0,
+                    columnDelta: -1,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveRightAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 0,
+                    columnDelta: 1,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveDownAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: 1,
+                    columnDelta: 0,
+                    extending: true
+                )
+                return true
+            case #selector(NSResponder.moveUpAndModifySelection(_:)):
+                moveFormulaReference(
+                    from: field,
+                    in: textView,
+                    rowDelta: -1,
+                    columnDelta: 0,
+                    extending: true
+                )
+                return true
+            default:
+                break
+            }
+        }
 
         switch commandSelector {
         case #selector(NSResponder.insertTab(_:)):
@@ -926,6 +1304,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func beginEditing(_ field: GridCellField, replacingWith replacement: String?) {
+        resetFormulaReferenceEntry()
         selectCell(field, extending: false)
         let key = reference(row: field.row, column: field.column)
         let initialText = replacement ?? activeSheet.cells[key] ?? ""
@@ -933,11 +1312,124 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         field.isEditable = true
         field.isSelectable = true
         field.selectText(nil)
-        DispatchQueue.main.async { [weak field] in
-            guard let field, let editor = field.currentEditor() as? NSTextView else { return }
+        formulaBar.stringValue = initialText
+        formulaEditingField = field
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard let self, let field, let editor = field.currentEditor() as? NSTextView else { return }
             editor.allowsUndo = true
             editor.string = initialText
             editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+            self.formulaReferenceEditorText = nil
+        }
+    }
+
+    private func moveFormulaReference(
+        from field: GridCellField,
+        in editor: NSTextView,
+        rowDelta: Int,
+        columnDelta: Int,
+        extending: Bool = false
+    ) {
+        let nextSelection = FormulaReferenceNavigator.move(
+            current: formulaReferenceSelection,
+            startingAt: CellPosition(row: field.row, column: field.column),
+            rowDelta: rowDelta,
+            columnDelta: columnDelta,
+            extending: extending,
+            rowCount: SpreadsheetGridView.rowCount,
+            columnCount: SpreadsheetGridView.columnCount
+        )
+        insertFormulaReference(nextSelection, into: editor, editingField: field)
+    }
+
+    private func insertFormulaReferenceIfNeeded(
+        to field: GridCellField,
+        extending: Bool
+    ) -> Bool {
+        guard let editingField = formulaEditingField,
+              editingField !== field,
+              let editor = editingField.currentEditor() as? NSTextView,
+              editor.string.hasPrefix("=")
+        else { return false }
+
+        let position = CellPosition(row: field.row, column: field.column)
+        let nextSelection: CellSelection
+        if extending, let formulaReferenceSelection {
+            nextSelection = formulaReferenceSelection.extending(to: position)
+        } else {
+            nextSelection = CellSelection(anchor: position, active: position)
+        }
+        insertFormulaReference(nextSelection, into: editor, editingField: editingField)
+        return true
+    }
+
+    private func insertFormulaReference(
+        _ referenceSelection: CellSelection,
+        into editor: NSTextView,
+        editingField: GridCellField
+    ) {
+        let currentLength = editor.string.utf16.count
+        let selectedRange = editor.selectedRange()
+        let savedRange = formulaReferenceTextRange
+        let replacementRange: NSRange
+        if let savedRange,
+           savedRange.location <= currentLength,
+           savedRange.location + savedRange.length <= currentLength {
+            replacementRange = savedRange
+        } else if selectedRange.location <= currentLength,
+                  selectedRange.location + selectedRange.length <= currentLength {
+            replacementRange = selectedRange
+        } else {
+            replacementRange = NSRange(location: currentLength, length: 0)
+        }
+
+        let referenceText = FormulaReferenceNavigator.referenceText(for: referenceSelection)
+        isApplyingFormulaReference = true
+        editor.insertText(referenceText, replacementRange: replacementRange)
+        let insertedRange = NSRange(location: replacementRange.location, length: referenceText.utf16.count)
+        editor.setSelectedRange(NSRange(location: NSMaxRange(insertedRange), length: 0))
+        editingField.stringValue = editor.string
+        isApplyingFormulaReference = false
+
+        formulaReferenceSelection = referenceSelection
+        formulaReferenceTextRange = insertedRange
+        formulaReferenceEditorText = editor.string
+        if let active = gridView.field(
+            row: referenceSelection.active.row,
+            column: referenceSelection.active.column
+        ) {
+            scrollFieldToVisible(active)
+        }
+        applySelectionAppearance()
+    }
+
+    private func resetFormulaReferenceEntry() {
+        formulaEditingField = nil
+        formulaReferenceSelection = nil
+        formulaReferenceTextRange = nil
+        formulaReferenceEditorText = nil
+        isApplyingFormulaReference = false
+    }
+
+    private func commitFormulaBar() {
+        guard let active = selection?.active else { return }
+        let key = reference(row: active.row, column: active.column)
+        let raw = formulaBar.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previous = workbook
+        if raw.isEmpty {
+            workbook.sheets[workbook.activeSheetIndex].cells.removeValue(forKey: key)
+        } else {
+            workbook.sheets[workbook.activeSheetIndex].cells[key] = raw
+        }
+        if workbook != previous {
+            history.record(previous, selection: selection)
+            persist()
+        }
+        loadActiveSheet()
+        if let field = gridView.field(row: active.row, column: active.column) {
+            selectedField = field
+            view.window?.makeFirstResponder(field)
+            applySelectionAppearance()
         }
     }
 
@@ -1262,15 +1754,34 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func applySelectionAppearance() {
+        let displaySelection = formulaReferenceSelection ?? selection
         for row in gridView.fields {
             for field in row {
+                let position = CellPosition(row: field.row, column: field.column)
                 let isSelected = selection?.contains(row: field.row, column: field.column) == true
-                let isActive = selection?.active == CellPosition(row: field.row, column: field.column)
+                    || formulaReferenceSelection?.contains(row: field.row, column: field.column) == true
+                let isActive = displaySelection?.active == position
                 field.setSelectionState(selected: isSelected, active: isActive)
             }
         }
-        gridView.updateHeaderSelection(selection)
-        gridView.updateFillHandle(selection)
+        gridView.updateHeaderSelection(displaySelection)
+        gridView.updateFillHandle(formulaReferenceSelection == nil ? selection : nil)
+        frozenColumnHeaders.update(selection: displaySelection)
+        frozenRowHeaders.update(selection: displaySelection)
+        refreshFormulaBar()
+    }
+
+    private func refreshFormulaBar() {
+        guard formulaBar.currentEditor() == nil else { return }
+        guard let active = selection?.active else {
+            cellReferenceField.stringValue = ""
+            formulaBar.stringValue = ""
+            return
+        }
+        cellReferenceField.stringValue = reference(row: active.row, column: active.column)
+        formulaBar.stringValue = activeSheet.cells[
+            reference(row: active.row, column: active.column)
+        ] ?? ""
     }
 
     private func jumpDestination(
@@ -1302,8 +1813,18 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func scrollFieldToVisible(_ field: GridCellField) {
-        gridView.scrollToVisible(field.frame.insetBy(dx: -4, dy: -4))
+        let clipView = scrollView.contentView
+        let visible = clipView.bounds
+        let fieldFrame = field.frame.insetBy(dx: -4, dy: -4)
+        let origin = FrozenHeaderGeometry.scrollOrigin(revealing: fieldFrame, within: visible)
+        clipView.scroll(to: origin)
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        refreshFrozenHeaders()
+    }
+
+    private func refreshFrozenHeaders() {
+        frozenColumnHeaders.needsDisplay = true
+        frozenRowHeaders.needsDisplay = true
     }
 
     private func persist() {
@@ -1465,6 +1986,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPanel() {
+        if let panel {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+
         let controller = SheetController(workbook: store.load()) { [weak self] workbook in
             self?.store.save(workbook)
         }
@@ -1488,7 +2015,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePanel() {
         panel?.orderOut(nil)
-        panel = nil
     }
 
     @objc private func recordHotkey() {
