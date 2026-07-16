@@ -980,6 +980,8 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     private let gridView = SpreadsheetGridView(frame: .zero)
     private let frozenColumnHeaders = FrozenHeaderView(axis: .columns)
     private let frozenRowHeaders = FrozenHeaderView(axis: .rows)
+    private let cellReferenceField = NSTextField(frame: .zero)
+    private let formulaBar = NSTextField(frame: .zero)
     private let tabs = NSStackView()
     private weak var selectedField: GridCellField?
     private var selection: CellSelection?
@@ -1037,6 +1039,27 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         header.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(header)
 
+        cellReferenceField.isEditable = false
+        cellReferenceField.isSelectable = false
+        cellReferenceField.isBezeled = true
+        cellReferenceField.alignment = .center
+        cellReferenceField.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        cellReferenceField.placeholderString = "Cell"
+
+        formulaBar.delegate = self
+        formulaBar.isEditable = true
+        formulaBar.isSelectable = true
+        formulaBar.isBezeled = true
+        formulaBar.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        formulaBar.placeholderString = "Enter a value or formula"
+
+        let formulaRow = NSStackView(views: [cellReferenceField, formulaBar])
+        formulaRow.orientation = .horizontal
+        formulaRow.alignment = .centerY
+        formulaRow.spacing = 6
+        formulaRow.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(formulaRow)
+
         scrollView.documentView = gridView
         scrollView.hasHorizontalScroller = true
         scrollView.hasVerticalScroller = true
@@ -1065,7 +1088,13 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
             header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             header.heightAnchor.constraint(equalToConstant: 24),
 
-            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            formulaRow.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            formulaRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            formulaRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            formulaRow.heightAnchor.constraint(equalToConstant: 24),
+            cellReferenceField.widthAnchor.constraint(equalToConstant: 72),
+
+            scrollView.topAnchor.constraint(equalTo: formulaRow.bottomAnchor, constant: 6),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             scrollView.bottomAnchor.constraint(equalTo: tabs.topAnchor, constant: -7),
@@ -1167,6 +1196,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     func controlTextDidChange(_ notification: Notification) {
+        if let editedField = notification.object as? NSTextField, editedField === formulaBar {
+            return
+        }
         guard let field = notification.object as? GridCellField,
               field === formulaEditingField,
               !isApplyingFormulaReference,
@@ -1176,6 +1208,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
 
         formulaReferenceTextRange = nil
         formulaReferenceEditorText = nil
+        formulaBar.stringValue = editor.string
         if !editor.string.hasPrefix("=") {
             formulaReferenceSelection = nil
         }
@@ -1183,6 +1216,10 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
+        if let editedField = notification.object as? NSTextField, editedField === formulaBar {
+            commitFormulaBar()
+            return
+        }
         guard let field = notification.object as? GridCellField else { return }
         resetFormulaReferenceEntry()
         save(field)
@@ -1294,6 +1331,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         field.isEditable = true
         field.isSelectable = true
         field.selectText(nil)
+        formulaBar.stringValue = initialText
         formulaEditingField = field
         DispatchQueue.main.async { [weak self, weak field] in
             guard let self, let field, let editor = field.currentEditor() as? NSTextView else { return }
@@ -1390,6 +1428,28 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         formulaReferenceTextRange = nil
         formulaReferenceEditorText = nil
         isApplyingFormulaReference = false
+    }
+
+    private func commitFormulaBar() {
+        guard let active = selection?.active else { return }
+        let key = reference(row: active.row, column: active.column)
+        let raw = formulaBar.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previous = workbook
+        if raw.isEmpty {
+            workbook.sheets[workbook.activeSheetIndex].cells.removeValue(forKey: key)
+        } else {
+            workbook.sheets[workbook.activeSheetIndex].cells[key] = raw
+        }
+        if workbook != previous {
+            history.record(previous, selection: selection)
+            persist()
+        }
+        loadActiveSheet()
+        if let field = gridView.field(row: active.row, column: active.column) {
+            selectedField = field
+            view.window?.makeFirstResponder(field)
+            applySelectionAppearance()
+        }
     }
 
     private func clearSelectedCells() {
@@ -1727,6 +1787,20 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         gridView.updateFillHandle(formulaReferenceSelection == nil ? selection : nil)
         frozenColumnHeaders.update(selection: displaySelection)
         frozenRowHeaders.update(selection: displaySelection)
+        refreshFormulaBar()
+    }
+
+    private func refreshFormulaBar() {
+        guard formulaBar.currentEditor() == nil else { return }
+        guard let active = selection?.active else {
+            cellReferenceField.stringValue = ""
+            formulaBar.stringValue = ""
+            return
+        }
+        cellReferenceField.stringValue = reference(row: active.row, column: active.column)
+        formulaBar.stringValue = activeSheet.cells[
+            reference(row: active.row, column: active.column)
+        ] ?? ""
     }
 
     private func jumpDestination(
