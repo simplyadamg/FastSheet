@@ -524,6 +524,7 @@ final class GridCellField: NSTextField {
     var onPaste: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
+    var onSelectAllCells: (() -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -570,6 +571,7 @@ final class GridCellField: NSTextField {
         let command = event.modifierFlags.contains(.command)
         if command {
             switch event.keyCode {
+            case 0: onSelectAllCells?(); return // A
             case 8: onCopy?(); return // C
             case 7: onCut?(); return // X
             case 9: onPaste?(); return // V
@@ -966,10 +968,9 @@ final class SpreadsheetGridView: FlippedView {
 // MARK: - Popup
 
 final class FastSheetPanel: NSPanel {
-    var onCancel: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
-    override func cancelOperation(_ sender: Any?) { onCancel?() }
+    override func cancelOperation(_ sender: Any?) {}
 }
 
 @MainActor
@@ -990,6 +991,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     private var formulaReferenceTextRange: NSRange?
     private var formulaReferenceEditorText: String?
     private var isApplyingFormulaReference = false
+    private var isCancellingEdit = false
     private var history = WorkbookHistory()
 
     init(workbook: Workbook, save: @escaping (Workbook) -> Void) {
@@ -1128,6 +1130,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
                 field.onPaste = { [weak self] in self?.pasteSelection() }
                 field.onUndo = { [weak self] in self?.undoWorkbookChange() }
                 field.onRedo = { [weak self] in self?.redoWorkbookChange() }
+                field.onSelectAllCells = { [weak self] in self?.selectAllCells() }
             }
         }
         gridView.onSelectRow = { [weak self] row in self?.selectRow(row) }
@@ -1198,11 +1201,30 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
 
     func controlTextDidEndEditing(_ notification: Notification) {
         if let editedField = notification.object as? NSTextField, editedField === formulaBar {
+            if isCancellingEdit {
+                isCancellingEdit = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.refreshFormulaBar()
+                    if let selectedField = self.selectedField {
+                        self.view.window?.makeFirstResponder(selectedField)
+                    }
+                }
+                return
+            }
             commitFormulaBar()
             return
         }
         guard let field = notification.object as? GridCellField else { return }
         resetFormulaReferenceEntry()
+        if isCancellingEdit {
+            isCancellingEdit = false
+            field.isEditable = false
+            field.isSelectable = false
+            loadActiveSheet()
+            applySelectionAppearance()
+            return
+        }
         save(field)
         field.isEditable = false
         field.isSelectable = false
@@ -1215,7 +1237,26 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         textView: NSTextView,
         doCommandBy commandSelector: Selector
     ) -> Bool {
+        if control === formulaBar {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                isCancellingEdit = true
+                view.window?.makeFirstResponder(nil)
+                return true
+            }
+            return false
+        }
+
         guard let field = control as? GridCellField else { return false }
+
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            isCancellingEdit = true
+            view.window?.makeFirstResponder(nil)
+            DispatchQueue.main.async { [weak self, weak field] in
+                guard let self, let field else { return }
+                self.selectCell(field, extending: false)
+            }
+            return true
+        }
 
         if field === formulaEditingField, textView.string.hasPrefix("=") {
             switch commandSelector {
@@ -2006,8 +2047,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popup.hasShadow = true
         popup.setContentSize(NSSize(width: 900, height: 500))
         popup.center()
-        popup.onCancel = { [weak self] in self?.closePanel() }
-
         panel = popup
         NSApp.activate(ignoringOtherApps: true)
         popup.makeKeyAndOrderFront(nil)
