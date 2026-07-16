@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>FinderStack</string>
-<key>CFBundleIdentifier</key><string>com.finderstack.app</string>
-<key>CFBundleName</key><string>FinderStack</string>
+<key>CFBundleExecutable</key><string>FastSheet</string>
+<key>CFBundleIdentifier</key><string>com.fastsheet.app</string>
+<key>CFBundleName</key><string>FastSheet</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
-<key>NSAppleEventsUsageDescription</key><string>FinderStack reads the current Finder folder to maintain your folder stack.</string>
+<key>NSHumanReadableCopyright</key><string>FastSheet</string>
 </dict></plist>

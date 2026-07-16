@@ -2,8 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "FinderStack",
+    name: "FastSheet",
     platforms: [.macOS(.v15)],
-    products: [.executable(name: "FinderStack", targets: ["FinderStack"])],
-    targets: [.executableTarget(name: "FinderStack")]
+    products: [.executable(name: "FastSheet", targets: ["FastSheet"])],
+    targets: [
+        .executableTarget(name: "FastSheet"),
+        .testTarget(name: "FastSheetTests", dependencies: ["FastSheet"])
+    ]
 )
