@@ -9,6 +9,35 @@ struct Sheet: Codable, Identifiable, Equatable {
     var name: String
     /// Raw user input. Formula cells retain the leading "=".
     var cells: [String: String] = [:]
+    var rowHeights: [Int: Double] = [:]
+    var columnWidths: [Int: Double] = [:]
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        cells: [String: String] = [:],
+        rowHeights: [Int: Double] = [:],
+        columnWidths: [Int: Double] = [:]
+    ) {
+        self.id = id
+        self.name = name
+        self.cells = cells
+        self.rowHeights = rowHeights
+        self.columnWidths = columnWidths
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, cells, rowHeights, columnWidths
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decode(String.self, forKey: .name)
+        cells = try container.decodeIfPresent([String: String].self, forKey: .cells) ?? [:]
+        rowHeights = try container.decodeIfPresent([Int: Double].self, forKey: .rowHeights) ?? [:]
+        columnWidths = try container.decodeIfPresent([Int: Double].self, forKey: .columnWidths) ?? [:]
+    }
 }
 
 struct Workbook: Codable, Equatable {
@@ -234,6 +263,206 @@ struct FormulaReferenceTranslator {
             mutable.replaceCharacters(in: match.range, with: replacement(groups))
         }
         return mutable as String
+    }
+}
+
+struct FormulaStructuralTranslator {
+    enum Axis: Equatable { case row, column }
+    enum Operation: Equatable { case insert, delete }
+
+    static func translate(
+        _ formula: String,
+        axis: Axis,
+        operation: Operation,
+        index: Int
+    ) -> String {
+        guard formula.hasPrefix("=") else { return formula }
+        var result = formula
+        if axis == .column {
+            result = replacingMatches(
+                in: result,
+                pattern: #"(?i)(\$?)([A-Z]+):(\$?)([A-Z]+)"#
+            ) { groups in
+                guard let first = columnIndex(groups[2]), let second = columnIndex(groups[4]),
+                      let shifted = adjustedRange(
+                        first, second, operation: operation, index: index
+                      )
+                else { return "#REF!" }
+                return groups[1] + FormulaEngine.columnName(shifted.0)
+                    + ":" + groups[3] + FormulaEngine.columnName(shifted.1)
+            }
+        }
+        return replacingMatches(
+            in: result,
+            pattern: #"(?i)(\$?)([A-Z]+)(\$?)([0-9]+)(?::(\$?)([A-Z]+)(\$?)([0-9]+))?"#
+        ) { groups in
+            guard let coordinates = FormulaEngine.coordinates(for: groups[2] + groups[4]) else {
+                return groups[0]
+            }
+            var row = coordinates.row
+            var column = coordinates.column
+            if !groups[6].isEmpty,
+               let endCoordinates = FormulaEngine.coordinates(for: groups[6] + groups[8]) {
+                var endRow = endCoordinates.row
+                var endColumn = endCoordinates.column
+                switch axis {
+                case .row:
+                    guard let shifted = adjustedRange(
+                        row, endRow, operation: operation, index: index
+                    ) else { return "#REF!" }
+                    row = shifted.0
+                    endRow = shifted.1
+                case .column:
+                    guard let shifted = adjustedRange(
+                        column, endColumn, operation: operation, index: index
+                    ) else { return "#REF!" }
+                    column = shifted.0
+                    endColumn = shifted.1
+                }
+                return groups[1] + FormulaEngine.columnName(column) + groups[3] + String(row + 1)
+                    + ":" + groups[5] + FormulaEngine.columnName(endColumn)
+                    + groups[7] + String(endRow + 1)
+            }
+            switch axis {
+            case .row:
+                guard let adjusted = adjusted(row, operation: operation, index: index) else {
+                    return "#REF!"
+                }
+                row = adjusted
+            case .column:
+                guard let adjusted = adjusted(column, operation: operation, index: index) else {
+                    return "#REF!"
+                }
+                column = adjusted
+            }
+            return groups[1] + FormulaEngine.columnName(column) + groups[3] + String(row + 1)
+        }
+    }
+
+    private static func adjustedRange(
+        _ first: Int,
+        _ second: Int,
+        operation: Operation,
+        index: Int
+    ) -> (Int, Int)? {
+        if operation == .delete, (min(first, second)...max(first, second)).contains(index) {
+            guard first != second else { return nil }
+            let low = min(first, second)
+            let high = max(first, second) - 1
+            return first <= second ? (low, high) : (high, low)
+        }
+        guard let shiftedFirst = adjusted(first, operation: operation, index: index),
+              let shiftedSecond = adjusted(second, operation: operation, index: index)
+        else { return nil }
+        return (shiftedFirst, shiftedSecond)
+    }
+
+    private static func columnIndex(_ letters: String) -> Int? {
+        FormulaEngine.coordinates(for: letters + "1")?.column
+    }
+
+    static func adjusted(_ value: Int, operation: Operation, index: Int) -> Int? {
+        switch operation {
+        case .insert:
+            return value >= index ? value + 1 : value
+        case .delete:
+            if value == index { return nil }
+            return value > index ? value - 1 : value
+        }
+    }
+
+    private static func replacingMatches(
+        in value: String,
+        pattern: String,
+        replacement: ([String]) -> String
+    ) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return value }
+        let mutable = NSMutableString(string: value)
+        let source = value as NSString
+        let matches = expression.matches(in: value, range: NSRange(location: 0, length: source.length))
+        for match in matches.reversed() {
+            let groups = (0..<match.numberOfRanges).map { group -> String in
+                let range = match.range(at: group)
+                return range.location == NSNotFound ? "" : source.substring(with: range)
+            }
+            mutable.replaceCharacters(in: match.range, with: replacement(groups))
+        }
+        return mutable as String
+    }
+}
+
+struct SheetStructuralEditor {
+    static func applying(
+        to sheet: Sheet,
+        axis: FormulaStructuralTranslator.Axis,
+        operation: FormulaStructuralTranslator.Operation,
+        index: Int,
+        rowCount: Int,
+        columnCount: Int
+    ) -> Sheet {
+        var result = sheet
+        var shiftedCells: [String: String] = [:]
+
+        for (reference, rawValue) in sheet.cells {
+            guard let coordinates = FormulaEngine.coordinates(for: reference) else { continue }
+            var row = coordinates.row
+            var column = coordinates.column
+            switch axis {
+            case .row:
+                guard let adjusted = FormulaStructuralTranslator.adjusted(
+                    row, operation: operation, index: index
+                ) else { continue }
+                row = adjusted
+            case .column:
+                guard let adjusted = FormulaStructuralTranslator.adjusted(
+                    column, operation: operation, index: index
+                ) else { continue }
+                column = adjusted
+            }
+            guard (0..<rowCount).contains(row), (0..<columnCount).contains(column) else { continue }
+            let shiftedReference = "\(FormulaEngine.columnName(column))\(row + 1)"
+            shiftedCells[shiftedReference] = FormulaStructuralTranslator.translate(
+                rawValue,
+                axis: axis,
+                operation: operation,
+                index: index
+            )
+        }
+        result.cells = shiftedCells
+
+        switch axis {
+        case .row:
+            result.rowHeights = shiftedSizes(
+                sheet.rowHeights,
+                operation: operation,
+                index: index,
+                limit: rowCount
+            )
+        case .column:
+            result.columnWidths = shiftedSizes(
+                sheet.columnWidths,
+                operation: operation,
+                index: index,
+                limit: columnCount
+            )
+        }
+        return result
+    }
+
+    private static func shiftedSizes(
+        _ sizes: [Int: Double],
+        operation: FormulaStructuralTranslator.Operation,
+        index: Int,
+        limit: Int
+    ) -> [Int: Double] {
+        var result: [Int: Double] = [:]
+        for (position, size) in sizes {
+            guard let adjusted = FormulaStructuralTranslator.adjusted(
+                position, operation: operation, index: index
+            ), (0..<limit).contains(adjusted) else { continue }
+            result[adjusted] = size
+        }
+        return result
     }
 }
 
@@ -702,10 +931,17 @@ final class FrozenHeaderView: FlippedView {
 
     let axis: Axis
     weak var scrollView: NSScrollView?
+    weak var gridView: SpreadsheetGridView?
     var selection: CellSelection?
     var onSelectRow: ((Int) -> Void)?
     var onSelectColumn: ((Int) -> Void)?
     var onSelectAll: (() -> Void)?
+    var onColumnResizeFinished: ((Int, CGFloat) -> Void)?
+    var onRowResizeFinished: ((Int, CGFloat) -> Void)?
+    var onAutoFitColumn: ((Int) -> Void)?
+    var onAutoFitRow: ((Int) -> Void)?
+    var menuForColumn: ((Int) -> NSMenu)?
+    var menuForRow: ((Int) -> NSMenu)?
 
     init(axis: Axis) {
         self.axis = axis
@@ -713,6 +949,29 @@ final class FrozenHeaderView: FlippedView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard let gridView else { return }
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            for column in gridView.columnWidths.indices {
+                let edge = gridView.columnOrigin(column) + gridView.columnWidths[column] - offset.x
+                let rect = NSRect(x: edge - 4, y: 0, width: 8, height: bounds.height)
+                if edge >= SpreadsheetGridView.rowHeaderWidth, rect.intersects(bounds) {
+                    addCursorRect(rect, cursor: .resizeLeftRight)
+                }
+            }
+        case .rows:
+            for row in gridView.rowHeights.indices {
+                let edge = gridView.rowOrigin(row) - SpreadsheetGridView.columnHeaderHeight
+                    + gridView.rowHeights[row] - offset.y
+                let rect = NSRect(x: 0, y: edge - 4, width: bounds.width, height: 8)
+                if rect.intersects(bounds) { addCursorRect(rect, cursor: .resizeUpDown) }
+            }
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -735,20 +994,47 @@ final class FrozenHeaderView: FlippedView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let offset = scrollView?.contentView.bounds.origin ?? .zero
+        if let boundary = boundary(at: point, offset: offset) {
+            if event.clickCount >= 2 {
+                axis == .columns ? onAutoFitColumn?(boundary) : onAutoFitRow?(boundary)
+                return
+            }
+            resize(boundary, from: event)
+            return
+        }
         switch axis {
         case .columns:
             if point.x < SpreadsheetGridView.rowHeaderWidth {
                 onSelectAll?()
-            } else if let column = FrozenHeaderGeometry.column(
-                at: point.x,
-                horizontalOffset: offset.x
-            ) {
+            } else if let column = gridView?.column(atDocumentX: point.x + offset.x) {
                 onSelectColumn?(column)
             }
         case .rows:
-            if let row = FrozenHeaderGeometry.row(at: point.y, verticalOffset: offset.y) {
+            if let row = gridView?.row(
+                atDocumentY: point.y + offset.y + SpreadsheetGridView.columnHeaderHeight
+            ) {
                 onSelectRow?(row)
             }
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let offset = scrollView?.contentView.bounds.origin ?? .zero
+        switch axis {
+        case .columns:
+            guard point.x >= SpreadsheetGridView.rowHeaderWidth,
+                  let column = gridView?.column(atDocumentX: point.x + offset.x),
+                  let menu = menuForColumn?(column)
+            else { return }
+            onSelectColumn?(column)
+            menu.popUp(positioning: nil, at: point, in: self)
+        case .rows:
+            guard let row = gridView?.row(
+                atDocumentY: point.y + offset.y + SpreadsheetGridView.columnHeaderHeight
+            ), let menu = menuForRow?(row) else { return }
+            onSelectRow?(row)
+            menu.popUp(positioning: nil, at: point, in: self)
         }
     }
 
@@ -758,6 +1044,7 @@ final class FrozenHeaderView: FlippedView {
     }
 
     private func drawColumnHeaders(horizontalOffset: CGFloat) {
+        guard let gridView else { return }
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: NSRect(
             x: SpreadsheetGridView.rowHeaderWidth,
@@ -767,7 +1054,12 @@ final class FrozenHeaderView: FlippedView {
         )).addClip()
 
         for column in 0..<SpreadsheetGridView.columnCount {
-            let frame = FrozenHeaderGeometry.columnFrame(column, horizontalOffset: horizontalOffset)
+            let frame = NSRect(
+                x: gridView.columnOrigin(column) - horizontalOffset,
+                y: 0,
+                width: gridView.columnWidths[column],
+                height: SpreadsheetGridView.columnHeaderHeight
+            )
             guard frame.intersects(bounds) else { continue }
             drawHeader(
                 FormulaEngine.columnName(column),
@@ -794,8 +1086,14 @@ final class FrozenHeaderView: FlippedView {
     }
 
     private func drawRowHeaders(verticalOffset: CGFloat) {
+        guard let gridView else { return }
         for row in 0..<SpreadsheetGridView.rowCount {
-            let frame = FrozenHeaderGeometry.rowFrame(row, verticalOffset: verticalOffset)
+            let frame = NSRect(
+                x: 0,
+                y: gridView.rowOrigin(row) - SpreadsheetGridView.columnHeaderHeight - verticalOffset,
+                width: SpreadsheetGridView.rowHeaderWidth,
+                height: gridView.rowHeights[row]
+            )
             guard frame.intersects(bounds) else { continue }
             drawHeader(
                 String(row + 1),
@@ -835,6 +1133,52 @@ final class FrozenHeaderView: FlippedView {
             withAttributes: attributes
         )
     }
+
+    private func boundary(at point: NSPoint, offset: NSPoint) -> Int? {
+        guard let gridView else { return nil }
+        let tolerance: CGFloat = 5
+        switch axis {
+        case .columns:
+            guard point.x >= SpreadsheetGridView.rowHeaderWidth else { return nil }
+            return gridView.columnWidths.indices.first {
+                let edge = gridView.columnOrigin($0) + gridView.columnWidths[$0] - offset.x
+                return edge >= SpreadsheetGridView.rowHeaderWidth
+                    && edge <= bounds.maxX
+                    && abs(edge - point.x) <= tolerance
+            }
+        case .rows:
+            return gridView.rowHeights.indices.first {
+                let edge = gridView.rowOrigin($0) - SpreadsheetGridView.columnHeaderHeight
+                    + gridView.rowHeights[$0] - offset.y
+                return edge >= bounds.minY && edge <= bounds.maxY && abs(edge - point.y) <= tolerance
+            }
+        }
+    }
+
+    private func resize(_ index: Int, from event: NSEvent) {
+        guard let window, let gridView else { return }
+        let start = event.locationInWindow
+        let original = axis == .columns ? gridView.columnWidths[index] : gridView.rowHeights[index]
+        while let tracked = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let delta = axis == .columns
+                ? tracked.locationInWindow.x - start.x
+                : start.y - tracked.locationInWindow.y
+            if axis == .columns {
+                gridView.setColumnWidth(original + delta, column: index)
+            } else {
+                gridView.setRowHeight(original + delta, row: index)
+            }
+            needsDisplay = true
+            if tracked.type == .leftMouseUp {
+                if axis == .columns {
+                    onColumnResizeFinished?(index, gridView.columnWidths[index])
+                } else {
+                    onRowResizeFinished?(index, gridView.rowHeights[index])
+                }
+                break
+            }
+        }
+    }
 }
 
 final class SpreadsheetGridView: FlippedView {
@@ -845,6 +1189,8 @@ final class SpreadsheetGridView: FlippedView {
     static let cellWidth: CGFloat = 110
     static let cellHeight: CGFloat = 28
 
+    private(set) var columnWidths: [CGFloat]
+    private(set) var rowHeights: [CGFloat]
     private(set) var fields: [[GridCellField]] = []
     private(set) var rowHeaders: [GridHeaderField] = []
     private(set) var columnHeaders: [GridHeaderField] = []
@@ -856,6 +1202,8 @@ final class SpreadsheetGridView: FlippedView {
     var onFillHandleDrag: ((NSPoint) -> Void)?
 
     override init(frame frameRect: NSRect) {
+        columnWidths = Array(repeating: Self.cellWidth, count: Self.columnCount)
+        rowHeights = Array(repeating: Self.cellHeight, count: Self.rowCount)
         super.init(frame: frameRect)
         buildGrid()
     }
@@ -863,26 +1211,14 @@ final class SpreadsheetGridView: FlippedView {
     required init?(coder: NSCoder) { nil }
 
     private func buildGrid() {
-        frame.size = NSSize(
-            width: Self.rowHeaderWidth + CGFloat(Self.columnCount) * Self.cellWidth,
-            height: Self.columnHeaderHeight + CGFloat(Self.rowCount) * Self.cellHeight
-        )
-
         let corner = headerLabel("", alignment: .center)
         corner.onClick = { [weak self] in self?.onSelectAll?() }
-        corner.frame = NSRect(x: 0, y: 0, width: Self.rowHeaderWidth, height: Self.columnHeaderHeight)
         addSubview(corner)
         cornerHeader = corner
 
         for column in 0..<Self.columnCount {
             let label = headerLabel(FormulaEngine.columnName(column), alignment: .center)
             label.onClick = { [weak self] in self?.onSelectColumn?(column) }
-            label.frame = NSRect(
-                x: Self.rowHeaderWidth + CGFloat(column) * Self.cellWidth,
-                y: 0,
-                width: Self.cellWidth,
-                height: Self.columnHeaderHeight
-            )
             addSubview(label)
             columnHeaders.append(label)
         }
@@ -890,24 +1226,12 @@ final class SpreadsheetGridView: FlippedView {
         for row in 0..<Self.rowCount {
             let rowLabel = headerLabel(String(row + 1), alignment: .right)
             rowLabel.onClick = { [weak self] in self?.onSelectRow?(row) }
-            rowLabel.frame = NSRect(
-                x: 0,
-                y: Self.columnHeaderHeight + CGFloat(row) * Self.cellHeight,
-                width: Self.rowHeaderWidth,
-                height: Self.cellHeight
-            )
             addSubview(rowLabel)
             rowHeaders.append(rowLabel)
 
             var rowFields: [GridCellField] = []
             for column in 0..<Self.columnCount {
                 let field = GridCellField(row: row, column: column)
-                field.frame = NSRect(
-                    x: Self.rowHeaderWidth + CGFloat(column) * Self.cellWidth,
-                    y: Self.columnHeaderHeight + CGFloat(row) * Self.cellHeight,
-                    width: Self.cellWidth,
-                    height: Self.cellHeight
-                )
                 addSubview(field)
                 rowFields.append(field)
             }
@@ -916,6 +1240,97 @@ final class SpreadsheetGridView: FlippedView {
 
         fillHandle.onDragFinished = { [weak self] point in self?.onFillHandleDrag?(point) }
         addSubview(fillHandle)
+        layoutGrid()
+    }
+
+    func configureSizes(rowHeights savedRows: [Int: Double], columnWidths savedColumns: [Int: Double]) {
+        rowHeights = (0..<Self.rowCount).map {
+            min(120, max(18, CGFloat(savedRows[$0] ?? Double(Self.cellHeight))))
+        }
+        columnWidths = (0..<Self.columnCount).map {
+            min(500, max(36, CGFloat(savedColumns[$0] ?? Double(Self.cellWidth))))
+        }
+        layoutGrid()
+    }
+
+    func setColumnWidth(_ width: CGFloat, column: Int) {
+        guard columnWidths.indices.contains(column) else { return }
+        columnWidths[column] = min(500, max(36, width))
+        layoutGrid()
+    }
+
+    func setRowHeight(_ height: CGFloat, row: Int) {
+        guard rowHeights.indices.contains(row) else { return }
+        rowHeights[row] = min(120, max(18, height))
+        layoutGrid()
+    }
+
+    func columnOrigin(_ column: Int) -> CGFloat {
+        Self.rowHeaderWidth + columnWidths.prefix(column).reduce(0, +)
+    }
+
+    func rowOrigin(_ row: Int) -> CGFloat {
+        Self.columnHeaderHeight + rowHeights.prefix(row).reduce(0, +)
+    }
+
+    func column(atDocumentX x: CGFloat) -> Int? {
+        guard x >= Self.rowHeaderWidth else { return nil }
+        for column in columnWidths.indices where x < columnOrigin(column) + columnWidths[column] {
+            return column
+        }
+        return nil
+    }
+
+    func row(atDocumentY y: CGFloat) -> Int? {
+        guard y >= Self.columnHeaderHeight else { return nil }
+        for row in rowHeights.indices where y < rowOrigin(row) + rowHeights[row] {
+            return row
+        }
+        return nil
+    }
+
+    func position(atDocumentPoint point: NSPoint) -> CellPosition? {
+        guard let row = row(atDocumentY: point.y), let column = column(atDocumentX: point.x) else {
+            return nil
+        }
+        return CellPosition(row: row, column: column)
+    }
+
+    func clampedPosition(atDocumentPoint point: NSPoint) -> CellPosition {
+        let row = row(atDocumentY: point.y)
+            ?? (point.y < Self.columnHeaderHeight ? 0 : Self.rowCount - 1)
+        let column = column(atDocumentX: point.x)
+            ?? (point.x < Self.rowHeaderWidth ? 0 : Self.columnCount - 1)
+        return CellPosition(row: row, column: column)
+    }
+
+    private func layoutGrid() {
+        frame.size = NSSize(
+            width: Self.rowHeaderWidth + columnWidths.reduce(0, +),
+            height: Self.columnHeaderHeight + rowHeights.reduce(0, +)
+        )
+        cornerHeader?.frame = NSRect(
+            x: 0, y: 0, width: Self.rowHeaderWidth, height: Self.columnHeaderHeight
+        )
+        for column in columnHeaders.indices {
+            columnHeaders[column].frame = NSRect(
+                x: columnOrigin(column), y: 0,
+                width: columnWidths[column], height: Self.columnHeaderHeight
+            )
+        }
+        for row in rowHeaders.indices {
+            rowHeaders[row].frame = NSRect(
+                x: 0, y: rowOrigin(row),
+                width: Self.rowHeaderWidth, height: rowHeights[row]
+            )
+            for column in fields[row].indices {
+                fields[row][column].frame = NSRect(
+                    x: columnOrigin(column), y: rowOrigin(row),
+                    width: columnWidths[column], height: rowHeights[row]
+                )
+            }
+        }
+        needsDisplay = true
     }
 
     private func headerLabel(_ text: String, alignment: NSTextAlignment) -> GridHeaderField {
@@ -1058,6 +1473,8 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
 
         frozenColumnHeaders.scrollView = scrollView
         frozenRowHeaders.scrollView = scrollView
+        frozenColumnHeaders.gridView = gridView
+        frozenRowHeaders.gridView = gridView
         frozenColumnHeaders.translatesAutoresizingMaskIntoConstraints = false
         frozenRowHeaders.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(frozenColumnHeaders)
@@ -1140,6 +1557,20 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         frozenColumnHeaders.onSelectColumn = { [weak self] column in self?.selectColumn(column) }
         frozenColumnHeaders.onSelectAll = { [weak self] in self?.selectAllCells() }
         frozenRowHeaders.onSelectRow = { [weak self] row in self?.selectRow(row) }
+        frozenColumnHeaders.onColumnResizeFinished = { [weak self] column, width in
+            self?.saveColumnWidth(width, column: column)
+        }
+        frozenRowHeaders.onRowResizeFinished = { [weak self] row, height in
+            self?.saveRowHeight(height, row: row)
+        }
+        frozenColumnHeaders.onAutoFitColumn = { [weak self] column in self?.autoFitColumn(column) }
+        frozenRowHeaders.onAutoFitRow = { [weak self] row in self?.autoFitRow(row) }
+        frozenColumnHeaders.menuForColumn = { [weak self] column in
+            self?.columnMenu(column) ?? NSMenu()
+        }
+        frozenRowHeaders.menuForRow = { [weak self] row in
+            self?.rowMenu(row) ?? NSMenu()
+        }
     }
 
     private var activeSheet: Sheet { workbook.sheets[workbook.activeSheetIndex] }
@@ -1150,6 +1581,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
 
     private func loadActiveSheet(focusing target: (row: Int, column: Int)? = nil) {
         let sheet = activeSheet
+        gridView.configureSizes(rowHeights: sheet.rowHeights, columnWidths: sheet.columnWidths)
         let engine = FormulaEngine(cells: sheet.cells)
         for row in gridView.fields {
             for field in row {
@@ -1609,10 +2041,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     private func fillSelection(toWindowPoint point: NSPoint) {
         guard let sourceSelection = selection else { return }
         let local = gridView.convert(point, from: nil)
-        let rawColumn = Int((local.x - SpreadsheetGridView.rowHeaderWidth) / SpreadsheetGridView.cellWidth)
-        let rawRow = Int((local.y - SpreadsheetGridView.columnHeaderHeight) / SpreadsheetGridView.cellHeight)
-        let targetRow = min(max(0, rawRow), SpreadsheetGridView.rowCount - 1)
-        let targetColumn = min(max(0, rawColumn), SpreadsheetGridView.columnCount - 1)
+        let target = gridView.clampedPosition(atDocumentPoint: local)
+        let targetRow = target.row
+        let targetColumn = target.column
         guard targetRow > sourceSelection.rows.upperBound || targetColumn > sourceSelection.columns.upperBound else { return }
 
         let previous = workbook
@@ -1750,10 +2181,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
 
     private func extendSelection(toWindowPoint point: NSPoint) {
         let local = gridView.convert(point, from: nil)
-        let rawColumn = Int((local.x - SpreadsheetGridView.rowHeaderWidth) / SpreadsheetGridView.cellWidth)
-        let rawRow = Int((local.y - SpreadsheetGridView.columnHeaderHeight) / SpreadsheetGridView.cellHeight)
-        let row = min(max(0, rawRow), SpreadsheetGridView.rowCount - 1)
-        let column = min(max(0, rawColumn), SpreadsheetGridView.columnCount - 1)
+        let position = gridView.clampedPosition(atDocumentPoint: local)
+        let row = position.row
+        let column = position.column
         guard let field = gridView.field(row: row, column: column) else { return }
         selectCell(field, extending: true)
     }
@@ -1866,6 +2296,211 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     private func refreshFrozenHeaders() {
         frozenColumnHeaders.needsDisplay = true
         frozenRowHeaders.needsDisplay = true
+        view.window?.invalidateCursorRects(for: frozenColumnHeaders)
+        view.window?.invalidateCursorRects(for: frozenRowHeaders)
+    }
+
+    private func saveColumnWidth(_ width: CGFloat, column: Int) {
+        guard (0..<SpreadsheetGridView.columnCount).contains(column) else { return }
+        let previous = workbook
+        if abs(width - SpreadsheetGridView.cellWidth) < 0.5 {
+            workbook.sheets[workbook.activeSheetIndex].columnWidths.removeValue(forKey: column)
+        } else {
+            workbook.sheets[workbook.activeSheetIndex].columnWidths[column] = Double(width)
+        }
+        guard workbook != previous else { return }
+        history.record(previous, selection: selection)
+        persist()
+        refreshFrozenHeaders()
+    }
+
+    private func saveRowHeight(_ height: CGFloat, row: Int) {
+        guard (0..<SpreadsheetGridView.rowCount).contains(row) else { return }
+        let previous = workbook
+        if abs(height - SpreadsheetGridView.cellHeight) < 0.5 {
+            workbook.sheets[workbook.activeSheetIndex].rowHeights.removeValue(forKey: row)
+        } else {
+            workbook.sheets[workbook.activeSheetIndex].rowHeights[row] = Double(height)
+        }
+        guard workbook != previous else { return }
+        history.record(previous, selection: selection)
+        persist()
+        refreshFrozenHeaders()
+    }
+
+    private func autoFitColumn(_ column: Int) {
+        guard (0..<SpreadsheetGridView.columnCount).contains(column) else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        ]
+        var width = (FormulaEngine.columnName(column) as NSString).size(withAttributes: attributes).width + 24
+        for row in 0..<SpreadsheetGridView.rowCount {
+            guard let field = gridView.field(row: row, column: column), !field.stringValue.isEmpty else {
+                continue
+            }
+            width = max(width, (field.stringValue as NSString).size(withAttributes: attributes).width + 18)
+        }
+        gridView.setColumnWidth(ceil(width), column: column)
+        saveColumnWidth(gridView.columnWidths[column], column: column)
+    }
+
+    private func autoFitRow(_ row: Int) {
+        guard (0..<SpreadsheetGridView.rowCount).contains(row) else { return }
+        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let height = ceil(font.boundingRectForFont.height + 10)
+        gridView.setRowHeight(height, row: row)
+        saveRowHeight(gridView.rowHeights[row], row: row)
+    }
+
+    private func columnMenu(_ column: Int) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(structuralMenuItem("Insert Column Left", action: #selector(insertColumnLeft(_:)), tag: column))
+        let insertRight = structuralMenuItem(
+            "Insert Column Right", action: #selector(insertColumnRight(_:)), tag: column
+        )
+        insertRight.isEnabled = column < SpreadsheetGridView.columnCount - 1
+        menu.addItem(insertRight)
+        menu.addItem(structuralMenuItem("Delete Column", action: #selector(deleteColumn(_:)), tag: column))
+        menu.addItem(.separator())
+        menu.addItem(structuralMenuItem("Auto-fit Column", action: #selector(autoFitColumnFromMenu(_:)), tag: column))
+        menu.addItem(structuralMenuItem("Reset Column Width", action: #selector(resetColumnWidth(_:)), tag: column))
+        return menu
+    }
+
+    private func rowMenu(_ row: Int) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(structuralMenuItem("Insert Row Above", action: #selector(insertRowAbove(_:)), tag: row))
+        let insertBelow = structuralMenuItem(
+            "Insert Row Below", action: #selector(insertRowBelow(_:)), tag: row
+        )
+        insertBelow.isEnabled = row < SpreadsheetGridView.rowCount - 1
+        menu.addItem(insertBelow)
+        menu.addItem(structuralMenuItem("Delete Row", action: #selector(deleteRow(_:)), tag: row))
+        menu.addItem(.separator())
+        menu.addItem(structuralMenuItem("Auto-fit Row", action: #selector(autoFitRowFromMenu(_:)), tag: row))
+        menu.addItem(structuralMenuItem("Reset Row Height", action: #selector(resetRowHeight(_:)), tag: row))
+        return menu
+    }
+
+    private func structuralMenuItem(_ title: String, action: Selector, tag: Int) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.tag = tag
+        return item
+    }
+
+    @objc private func insertColumnLeft(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .column, operation: .insert, index: sender.tag)
+    }
+
+    @objc private func insertColumnRight(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .column, operation: .insert, index: sender.tag + 1)
+    }
+
+    @objc private func deleteColumn(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .column, operation: .delete, index: sender.tag)
+    }
+
+    @objc private func insertRowAbove(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .row, operation: .insert, index: sender.tag)
+    }
+
+    @objc private func insertRowBelow(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .row, operation: .insert, index: sender.tag + 1)
+    }
+
+    @objc private func deleteRow(_ sender: NSMenuItem) {
+        performStructuralEdit(axis: .row, operation: .delete, index: sender.tag)
+    }
+
+    @objc private func autoFitColumnFromMenu(_ sender: NSMenuItem) {
+        autoFitColumn(sender.tag)
+    }
+
+    @objc private func autoFitRowFromMenu(_ sender: NSMenuItem) {
+        autoFitRow(sender.tag)
+    }
+
+    @objc private func resetColumnWidth(_ sender: NSMenuItem) {
+        gridView.setColumnWidth(SpreadsheetGridView.cellWidth, column: sender.tag)
+        saveColumnWidth(SpreadsheetGridView.cellWidth, column: sender.tag)
+    }
+
+    @objc private func resetRowHeight(_ sender: NSMenuItem) {
+        gridView.setRowHeight(SpreadsheetGridView.cellHeight, row: sender.tag)
+        saveRowHeight(SpreadsheetGridView.cellHeight, row: sender.tag)
+    }
+
+    private func performStructuralEdit(
+        axis: FormulaStructuralTranslator.Axis,
+        operation: FormulaStructuralTranslator.Operation,
+        index: Int
+    ) {
+        let limit = axis == .row ? SpreadsheetGridView.rowCount : SpreadsheetGridView.columnCount
+        guard (0..<limit).contains(index) else { return }
+        view.window?.makeFirstResponder(nil)
+
+        if operation == .insert, terminalBoundaryContainsData(axis: axis) {
+            let noun = axis == .row ? "row" : "column"
+            let alert = NSAlert()
+            alert.messageText = "Cannot Insert \(noun.capitalized)"
+            alert.informativeText = "The last \(noun) contains data that would be pushed outside the sheet. Clear it first, then try again."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        if operation == .delete, structuralBandContainsData(axis: axis, index: index) {
+            let noun = axis == .row ? "row" : "column"
+            let displayIndex = axis == .row ? String(index + 1) : FormulaEngine.columnName(index)
+            let alert = NSAlert()
+            alert.messageText = "Delete \(noun.capitalized) \(displayIndex)?"
+            alert.informativeText = "This \(noun) contains data. Deleting it will remove those cell values."
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        let previous = workbook
+        workbook.sheets[workbook.activeSheetIndex] = SheetStructuralEditor.applying(
+            to: activeSheet,
+            axis: axis,
+            operation: operation,
+            index: index,
+            rowCount: SpreadsheetGridView.rowCount,
+            columnCount: SpreadsheetGridView.columnCount
+        )
+        guard workbook != previous else { return }
+
+        let activePosition: CellPosition
+        if axis == .row {
+            activePosition = CellPosition(row: index, column: selection?.active.column ?? 0)
+        } else {
+            activePosition = CellPosition(row: selection?.active.row ?? 0, column: index)
+        }
+        let newSelection = CellSelection(anchor: activePosition, active: activePosition)
+        history.record(previous, selection: newSelection)
+        selection = newSelection
+        persist()
+        loadActiveSheet()
+        restoreSelectionFocus()
+    }
+
+    private func terminalBoundaryContainsData(axis: FormulaStructuralTranslator.Axis) -> Bool {
+        let boundary = axis == .row
+            ? SpreadsheetGridView.rowCount - 1
+            : SpreadsheetGridView.columnCount - 1
+        return structuralBandContainsData(axis: axis, index: boundary)
+    }
+
+    private func structuralBandContainsData(
+        axis: FormulaStructuralTranslator.Axis,
+        index: Int
+    ) -> Bool {
+        activeSheet.cells.keys.contains { reference in
+            guard let coordinates = FormulaEngine.coordinates(for: reference) else { return false }
+            return axis == .row ? coordinates.row == index : coordinates.column == index
+        }
     }
 
     private func persist() {
