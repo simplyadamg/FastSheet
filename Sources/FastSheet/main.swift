@@ -1021,23 +1021,9 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
     }
 
     private func buildInterface() {
-        let title = NSTextField(labelWithString: "FastSheet")
-        title.font = .systemFont(ofSize: 16, weight: .semibold)
-
-        let hint = NSTextField(labelWithString: "Enter values or formulas, e.g. =A1+B1 or =SUM(A1:A10)")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-
         let addSheetButton = NSButton(title: "+", target: self, action: #selector(addSheet))
         addSheetButton.toolTip = "New sheet"
         addSheetButton.bezelStyle = .texturedRounded
-
-        let header = NSStackView(views: [title, hint, NSView(), addSheetButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 10
-        header.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(header)
 
         cellReferenceField.isEditable = false
         cellReferenceField.isSelectable = false
@@ -1053,7 +1039,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         formulaBar.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         formulaBar.placeholderString = "Enter a value or formula"
 
-        let formulaRow = NSStackView(views: [cellReferenceField, formulaBar])
+        let formulaRow = NSStackView(views: [cellReferenceField, formulaBar, addSheetButton])
         formulaRow.orientation = .horizontal
         formulaRow.alignment = .centerY
         formulaRow.spacing = 6
@@ -1083,12 +1069,7 @@ final class SheetController: NSViewController, NSTextFieldDelegate {
         view.addSubview(tabs)
 
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
-            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            header.heightAnchor.constraint(equalToConstant: 24),
-
-            formulaRow.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            formulaRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
             formulaRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
             formulaRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             formulaRow.heightAnchor.constraint(equalToConstant: 24),
@@ -2005,6 +1986,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPanel() {
+        if let panel {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+
         let controller = SheetController(workbook: store.load()) { [weak self] workbook in
             self?.store.save(workbook)
         }
@@ -2028,7 +2015,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePanel() {
         panel?.orderOut(nil)
-        panel = nil
     }
 
     @objc private func recordHotkey() {
